@@ -463,8 +463,10 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             Err(_) => 65536,
         };
 
+        let max_mmap_size = if cfg.use_mmap { cfg.max_mmap_size } else { 0 };
+
         let mmap_cache_builder = Cache::builder()
-            .max_capacity(cfg.max_mmap_size)
+            .max_capacity(max_mmap_size)
             .weigher(
                 |_key: &MmapChunkKey, value: &Arc<RwLock<mmap::MmapCachedValue>>| -> u32 {
                     let guard = block_on(value.read());
@@ -957,26 +959,31 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         inode: Inode,
         offset: u64,
         file: &File,
-    ) -> Option<Arc<RwLock<mmap::MmapCachedValue>>> {
-        let key = MmapChunkKey::new(inode, offset);
-        let ret = self
-            .mmap_chunks
-            .entry(key)
-            .or_try_insert_with(async {
-                let mmap = mmap::create_mmap(offset, file).await;
-                match mmap {
-                    Ok(v) => Ok(v),
-                    Err(e) => Err(Arc::new(e)),
-                }
-            })
-            .await;
-        match ret {
-            Ok(v) => Some(v.value().clone()),
-            Err(e) => {
-                error!("Failed to create mmap: {e}");
-                None
+    ) -> Option<(Arc<RwLock<mmap::MmapCachedValue>>, u64)> {
+        let file_size = file.metadata().unwrap().len();
+        let key = MmapChunkKey::new(inode, offset, file_size);
+        let aligned_offset = key.aligned_offset;
+
+        if let Some(cached) = self.mmap_chunks.get(&key).await {
+            let guard = cached.read().await;
+            let cache_len = match &*guard {
+                MmapCachedValue::Mmap(mmap) => mmap.len() as u64,
+                MmapCachedValue::MmapMut(mmap_mut) => mmap_mut.len() as u64,
+            };
+            if offset < key.aligned_offset + cache_len {
+                return Some((cached.clone(), key.aligned_offset));
             }
         }
+
+        let mmap = match mmap::create_mmap(offset, file).await {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Failed to create mmap:{e}");
+                return None;
+            }
+        };
+        self.mmap_chunks.insert(key, mmap.clone()).await;
+        Some((mmap, aligned_offset))
     }
 
     async fn read_from_mmap(
@@ -1011,9 +1018,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let mut buf_offset = 0;
 
         while len > 0 {
-            let chunk = self.get_mmap(inode, current_offset, file).await;
-            let chunk = match chunk {
-                Some(chunk) => chunk,
+            let (chunk, chunk_start_offset) = match self.get_mmap(inode, current_offset, file).await
+            {
+                Some((chunk, aligned_offset)) => (chunk, aligned_offset),
                 None => {
                     return Err(std::io::Error::other("Failed to get mmap chunk"));
                 }
@@ -1024,9 +1031,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 MmapCachedValue::Mmap(mmap) => {
                     let chunk_len = mmap.len();
 
-                    // compute the start offset within the chunk
-                    let chunk_start_offset =
-                        mmap::align_down(current_offset, mmap::get_effective_page_size(file_size));
+                    // compute the start offset within the chunk using cached alignment
                     let copy_start = (current_offset - chunk_start_offset) as usize;
 
                     // ensure we don't read beyond the chunk boundary
@@ -1051,9 +1056,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 MmapCachedValue::MmapMut(mmap_mut) => {
                     let chunk_len = mmap_mut.len();
 
-                    // compute the start offset within the chunk
-                    let chunk_start_offset =
-                        mmap::align_down(current_offset, mmap::get_effective_page_size(file_size));
+                    // compute the start offset within the chunk using cached alignment
                     let copy_start = (current_offset - chunk_start_offset) as usize;
 
                     // ensure we don't read beyond the chunk boundary
@@ -1098,6 +1101,8 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             if res < 0 {
                 return Err(std::io::Error::other("error to ftruncate"));
             }
+
+            self.invalidate_mmap_cache(inode, file_size).await;
         }
 
         let mut remaining = len;
@@ -1105,9 +1110,9 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         let mut data_offset = 0;
 
         while remaining > 0 {
-            let chunk = self.get_mmap(inode, current_offset, file).await;
-            let chunk = match chunk {
-                Some(chunk) => chunk,
+            let (chunk, chunk_start_offset) = match self.get_mmap(inode, current_offset, file).await
+            {
+                Some((chunk, aligned_offset)) => (chunk, aligned_offset),
                 None => {
                     return Err(std::io::Error::other("Failed to get mmap chunk"));
                 }
@@ -1124,9 +1129,7 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                 MmapCachedValue::MmapMut(mmap_mut) => {
                     let chunk_len = mmap_mut.len();
 
-                    // Calculate the start position of the current chunk
-                    let chunk_start_offset =
-                        mmap::align_down(current_offset, mmap::get_effective_page_size(file_size));
+                    // Calculate the start position of the current chunk using cached alignment
                     let copy_start = (current_offset - chunk_start_offset) as usize;
 
                     // Ensure we don't write beyond the chunk boundary
@@ -1147,10 +1150,26 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
                     data_offset += copy_len;
                     remaining -= copy_len;
                     current_offset += copy_len as u64;
+                    mmap_mut.flush_async_range(copy_start, copy_len)?;
                 }
             }
         }
         Ok(data_offset)
+    }
+
+    async fn invalidate_mmap_cache(&self, inode: Inode, old_size: u64) {
+        let keys_to_remove: Vec<_> = self
+            .mmap_chunks
+            .iter()
+            .filter(|item| {
+                let key = item.0.clone();
+                key.inode == inode && key.aligned_offset + mmap::MAX_WINDOW_SIZE as u64 >= old_size
+            })
+            .collect();
+
+        for item in keys_to_remove {
+            self.mmap_chunks.invalidate(&item.0).await;
+        }
     }
 }
 
