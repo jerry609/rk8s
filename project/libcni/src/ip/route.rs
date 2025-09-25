@@ -384,17 +384,17 @@ pub async fn interface_table(ifindex: u32) -> anyhow::Result<Vec<Interface>> {
 pub async fn interfaces() -> Result<Vec<Interface>> {
     interface_table(0)
         .await
-        .map_err(|e| anyhow!("route: ip+net: {}", e))
+        .map_err(|e| anyhow!("route: ip+net: {e}"))
 }
 
 pub async fn interface_by_index(index: u32) -> Result<Interface> {
     if index == 0 {
-        return Err(anyhow!("invalid interface index: {}", index));
+        return Err(anyhow!("invalid interface index: {index}"));
     }
 
     let ift = interface_table(index)
         .await
-        .map_err(|e| anyhow!("route: ip+net: {}", e))?;
+        .map_err(|e| anyhow!("route: ip+net: {e}"))?;
 
     for iface in &ift {
         if iface.index == index {
@@ -402,12 +402,12 @@ pub async fn interface_by_index(index: u32) -> Result<Interface> {
         }
     }
 
-    Err(anyhow!("no such interface with index {}", index))
+    Err(anyhow!("no such interface with index {index}"))
 }
 
 pub async fn interface_by_name(name: String) -> Result<Interface> {
     if name.is_empty() {
-        return Err(anyhow!("invalid interface name: {}", name));
+        return Err(anyhow!("invalid interface name: {name}"));
     }
 
     let ift = interfaces().await?;
@@ -418,5 +418,5 @@ pub async fn interface_by_name(name: String) -> Result<Interface> {
         }
     }
 
-    Err(anyhow!("no such interface with name {}", name))
+    Err(anyhow!("no such interface with name {name}"))
 }

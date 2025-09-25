@@ -33,6 +33,6 @@ cargo.rust_library(
     deps = [
         "//third-party/rust/crates/filetime/0.2.26:filetime-0.2.26",
         "//third-party/rust/crates/libc/0.2.175:libc-0.2.175",
-        "//third-party/rust/crates/xattr/1.5.1:xattr-1.5.1",
+        "//third-party/rust/crates/xattr/1.6.1:xattr-1.6.1",
     ],
 )

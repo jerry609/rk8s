@@ -27,10 +27,10 @@ cargo.rust_library(
     },
     named_deps = {
         "futures_util": "//third-party/rust/crates/futures-util/0.3.31:futures-util-0.3.31",
-        "js_sys": "//third-party/rust/crates/js-sys/0.3.78:js-sys-0.3.78",
-        "wasm_bindgen": "//third-party/rust/crates/wasm-bindgen/0.2.101:wasm-bindgen-0.2.101",
-        "wasm_bindgen_futures": "//third-party/rust/crates/wasm-bindgen-futures/0.4.51:wasm-bindgen-futures-0.4.51",
-        "web_sys": "//third-party/rust/crates/web-sys/0.3.78:web-sys-0.3.78",
+        "js_sys": "//third-party/rust/crates/js-sys/0.3.80:js-sys-0.3.80",
+        "wasm_bindgen": "//third-party/rust/crates/wasm-bindgen/0.2.103:wasm-bindgen-0.2.103",
+        "wasm_bindgen_futures": "//third-party/rust/crates/wasm-bindgen-futures/0.4.53:wasm-bindgen-futures-0.4.53",
+        "web_sys": "//third-party/rust/crates/web-sys/0.3.80:web-sys-0.3.80",
     },
     visibility = ["PUBLIC"],
 )

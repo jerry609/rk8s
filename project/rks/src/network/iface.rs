@@ -339,9 +339,7 @@ pub fn check_hostgw_compatibility(interface: &ExternalInterface) -> Result<()> {
         (Some(ext_addr), Some(iface_addr)) => {
             if ext_addr != iface_addr {
                 return Err(anyhow!(
-                    "Your PublicIP ({}) differs from interface IP ({}), meaning that probably you're on a NAT, which is not supported by host-gw backend",
-                    ext_addr,
-                    iface_addr
+                    "Your PublicIP ({ext_addr}) differs from interface IP ({iface_addr}), meaning that probably you're on a NAT, which is not supported by host-gw backend"
                 ));
             }
         }

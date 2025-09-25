@@ -538,10 +538,7 @@ async fn handle_heartbeat(
         xline_store.insert_node_yaml(node_name, &new_yaml).await?;
         info!("[worker dispatch] heartbeat from {node_name}");
     } else {
-        warn!(
-            "[server] heartbeat received for unknown node: {}",
-            node_name
-        );
+        warn!("[server] heartbeat received for unknown node: {node_name}");
     }
 
     Ok(())

@@ -51,7 +51,7 @@ cargo.rust_library(
         "//third-party/rust/crates/http/0.2.12:http-0.2.12",
         "//third-party/rust/crates/itoa/1.0.15:itoa-1.0.15",
         "//third-party/rust/crates/ryu/1.0.20:ryu-1.0.20",
-        "//third-party/rust/crates/time/0.3.43:time-0.3.43",
+        "//third-party/rust/crates/time/0.3.44:time-0.3.44",
         "//third-party/rust/crates/tokio/1.47.1:tokio-1.47.1",
     ],
 )

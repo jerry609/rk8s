@@ -87,9 +87,8 @@
       "gid": 0
     },
     "args": [
-      "dd",
-      "if=/dev/zero",
-      "of=/dev/null"
+      "sleep",
+      "36000"
     ],
     "env": [
       "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -98,34 +97,34 @@
     "cwd": "/",
     "capabilities": {
       "bounding": [
-        "CAP_KILL",
-        "CAP_NET_BIND_SERVICE",
+        "CAP_AUDIT_WRITE",
         "CAP_NET_RAW",
-        "CAP_AUDIT_WRITE"
+        "CAP_KILL",
+        "CAP_NET_BIND_SERVICE"
       ],
       "effective": [
-        "CAP_KILL",
-        "CAP_NET_BIND_SERVICE",
+        "CAP_AUDIT_WRITE",
         "CAP_NET_RAW",
-        "CAP_AUDIT_WRITE"
+        "CAP_KILL",
+        "CAP_NET_BIND_SERVICE"
       ],
       "inheritable": [
-        "CAP_KILL",
-        "CAP_NET_BIND_SERVICE",
+        "CAP_AUDIT_WRITE",
         "CAP_NET_RAW",
-        "CAP_AUDIT_WRITE"
+        "CAP_KILL",
+        "CAP_NET_BIND_SERVICE"
       ],
       "permitted": [
-        "CAP_KILL",
-        "CAP_NET_BIND_SERVICE",
+        "CAP_AUDIT_WRITE",
         "CAP_NET_RAW",
-        "CAP_AUDIT_WRITE"
+        "CAP_KILL",
+        "CAP_NET_BIND_SERVICE"
       ],
       "ambient": [
-        "CAP_KILL",
-        "CAP_NET_BIND_SERVICE",
+        "CAP_AUDIT_WRITE",
         "CAP_NET_RAW",
-        "CAP_AUDIT_WRITE"
+        "CAP_KILL",
+        "CAP_NET_BIND_SERVICE"
       ]
     },
     "rlimits": [
@@ -142,7 +141,7 @@
   "linux": {
     "resources": {
       "memory": {
-        "limit": 536870912
+        "limit": 244318208
       },
       "cpu": {
         "quota": 500000,
@@ -151,20 +150,16 @@
     },
     "namespaces": [
       {
-        "type": "pid",
-        "path": "/proc/40580/ns/pid"
+        "type": "pid"
       },
       {
-        "type": "network",
-        "path": "/proc/40580/ns/net"
+        "type": "network"
       },
       {
-        "type": "ipc",
-        "path": "/proc/40580/ns/ipc"
+        "type": "ipc"
       },
       {
-        "type": "uts",
-        "path": "/proc/40580/ns/uts"
+        "type": "uts"
       },
       {
         "type": "mount"

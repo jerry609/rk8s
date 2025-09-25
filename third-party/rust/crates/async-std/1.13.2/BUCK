@@ -51,7 +51,7 @@ cargo.rust_library(
     named_deps = {
         "async_channel": "//third-party/rust/crates/async-channel/1.9.0:async-channel-1.9.0",
         "async_global_executor": "//third-party/rust/crates/async-global-executor/2.4.1:async-global-executor-2.4.1",
-        "async_io": "//third-party/rust/crates/async-io/2.5.0:async-io-2.5.0",
+        "async_io": "//third-party/rust/crates/async-io/2.6.0:async-io-2.6.0",
         "async_lock": "//third-party/rust/crates/async-lock/3.4.1:async-lock-3.4.1",
         "crossbeam_utils": "//third-party/rust/crates/crossbeam-utils/0.8.21:crossbeam-utils-0.8.21",
         "futures_core": "//third-party/rust/crates/futures-core/0.3.31:futures-core-0.3.31",

@@ -564,7 +564,7 @@ pub fn kv_to_ip_lease(kv: &KeyValue, ttl: i64) -> Result<Lease, XlineRegistryErr
     let key_str = std::str::from_utf8(kv.key())?;
     let (subnet4, subnet6) =
         crate::network::subnet::parse_subnet_key(key_str).ok_or_else(|| {
-            XlineRegistryError::Other(anyhow::anyhow!("invalid subnet key: {}", key_str))
+            XlineRegistryError::Other(anyhow::anyhow!("invalid subnet key: {key_str}"))
         })?;
     let attrs: LeaseAttrs = serde_json::from_slice(kv.value())?;
 

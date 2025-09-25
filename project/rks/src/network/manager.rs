@@ -194,7 +194,7 @@ impl LocalManager {
         let prefix_len = config.subnet_len;
 
         let mut current = Ipv4Network::new(start_ip, prefix_len)
-            .map_err(|e| anyhow!("Invalid subnet start: {}", e))?;
+            .map_err(|e| anyhow!("Invalid subnet start: {e}"))?;
 
         while current.ip() <= end_ip && available_v4.len() < 100 {
             if !leases.iter().any(|l| l.subnet == current) {
@@ -207,7 +207,7 @@ impl LocalManager {
             && let (Some(min_v6), Some(max_v6)) = (config.ipv6_subnet_min, config.ipv6_subnet_max)
         {
             let mut sn6 = Ipv6Network::new(min_v6, config.ipv6_subnet_len)
-                .map_err(|e| anyhow!("Invalid IPv6 subnet start: {}", e))?;
+                .map_err(|e| anyhow!("Invalid IPv6 subnet start: {e}"))?;
 
             while sn6.ip() <= max_v6 && available_v6.len() < 100 {
                 if !leases.iter().any(|l| l.ipv6_subnet == Some(sn6)) {

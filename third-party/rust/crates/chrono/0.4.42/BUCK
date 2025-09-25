@@ -41,9 +41,9 @@ cargo.rust_library(
         "windows-link",
     ],
     named_deps = {
-        "iana_time_zone": "//third-party/rust/crates/iana-time-zone/0.1.63:iana-time-zone-0.1.63",
+        "iana_time_zone": "//third-party/rust/crates/iana-time-zone/0.1.64:iana-time-zone-0.1.64",
         "num_traits": "//third-party/rust/crates/num-traits/0.2.19:num-traits-0.2.19",
     },
     visibility = ["PUBLIC"],
-    deps = ["//third-party/rust/crates/serde/1.0.219:serde-1.0.219"],
+    deps = ["//third-party/rust/crates/serde/1.0.226:serde-1.0.226"],
 )

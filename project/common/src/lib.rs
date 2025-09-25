@@ -199,3 +199,41 @@ pub struct ExternalInterface {
     pub ext_addr: Option<Ipv4Addr>,
     pub ext_v6_addr: Option<Ipv6Addr>,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ServiceSpec {
+    #[serde(rename = "type", default = "default_service_type")]
+    pub service_type: String, // ClusterIP, NodePort, LoadBalancer
+    #[serde(default)]
+    pub selector: HashMap<String, String>,
+    #[serde(default)]
+    pub ports: Vec<ServicePort>,
+    #[serde(rename = "clusterIP", default)]
+    pub cluster_ip: Option<String>,
+}
+
+fn default_service_type() -> String {
+    "ClusterIP".to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ServicePort {
+    #[serde(rename = "port")]
+    pub port: i32,
+    #[serde(rename = "targetPort", default)]
+    pub target_port: Option<i32>,
+    #[serde(rename = "protocol", default = "default_protocol")]
+    pub protocol: String, // TCP/UDP
+    #[serde(rename = "nodePort", default)]
+    pub node_port: Option<i32>, // NodePort
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ServiceTask {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    #[serde(rename = "kind")]
+    pub kind: String,
+    pub metadata: ObjectMeta,
+    pub spec: ServiceSpec,
+}

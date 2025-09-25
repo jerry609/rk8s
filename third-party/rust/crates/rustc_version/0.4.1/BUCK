@@ -26,5 +26,5 @@ cargo.rust_library(
         "CARGO_PKG_VERSION_PRE": "",
     },
     visibility = ["PUBLIC"],
-    deps = ["//third-party/rust/crates/semver/1.0.26:semver-1.0.26"],
+    deps = ["//third-party/rust/crates/semver/1.0.27:semver-1.0.27"],
 )

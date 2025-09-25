@@ -35,5 +35,5 @@ cargo.rust_library(
         "num_traits": "//third-party/rust/crates/num-traits/0.2.19:num-traits-0.2.19",
     },
     visibility = ["PUBLIC"],
-    deps = ["//third-party/rust/crates/pxfm/0.1.23:pxfm-0.1.23"],
+    deps = ["//third-party/rust/crates/pxfm/0.1.24:pxfm-0.1.24"],
 )

@@ -120,11 +120,11 @@ pub fn check_network_config(cfg: &mut Config) -> Result<()> {
         let mask = u32::MAX << (32 - cfg.subnet_len);
         let min_u = u32::from(min_ip);
         if min_u != (min_u & mask) {
-            anyhow::bail!("SubnetMin is not on a SubnetLen boundary: {}", min_ip);
+            anyhow::bail!("SubnetMin is not on a SubnetLen boundary: {min_ip}");
         }
         let max_u = u32::from(max_ip);
         if max_u != (max_u & mask) {
-            anyhow::bail!("SubnetMax is not on a SubnetLen boundary: {}", max_ip);
+            anyhow::bail!("SubnetMax is not on a SubnetLen boundary: {max_ip}");
         }
     }
 
@@ -179,12 +179,12 @@ pub fn check_network_config(cfg: &mut Config) -> Result<()> {
 
         let min_b = min6.to_bits();
         if min_b & mask != min_b {
-            anyhow::bail!("SubnetMin is not on a SubnetLen boundary: {}", min6);
+            anyhow::bail!("SubnetMin is not on a SubnetLen boundary: {min6}");
         }
 
         let max_b = max6.to_bits();
         if max_b & mask != max_b {
-            anyhow::bail!("SubnetMax is not on a SubnetLen boundary: {}", max6);
+            anyhow::bail!("SubnetMax is not on a SubnetLen boundary: {max6}");
         }
     }
 

@@ -12,7 +12,7 @@ use log::debug;
 pub async fn config_interface(if_name: &str, exec_result: &SuccessReply) -> anyhow::Result<()> {
     let link = link::link_by_name(if_name)
         .await
-        .map_err(|e| anyhow!("{}", e))?;
+        .map_err(|e| anyhow!("{e}"))?;
 
     let ips = &exec_result.ips;
     if exec_result.ips.is_empty() {
@@ -27,10 +27,7 @@ pub async fn config_interface(if_name: &str, exec_result: &SuccessReply) -> anyh
         if int_idx >= exec_result.interfaces.len()
             || exec_result.interfaces[int_idx].name != if_name
         {
-            bail!(
-                "failed to add IP addr to {}: invalid interface index",
-                if_name
-            );
+            bail!("failed to add IP addr to {if_name}: invalid interface index");
         }
         // add address to veth interface
         debug!("add ip:{ips:?} to:{if_name:?}");

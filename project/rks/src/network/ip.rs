@@ -94,7 +94,7 @@ pub async fn lookup_ext_iface(
     }
 
     let ifregex = if let Some(s) = ifregex_s.as_ref() {
-        Some(Regex::new(s).map_err(|e| anyhow!("could not compile regex: {}", e))?)
+        Some(Regex::new(s).map_err(|e| anyhow!("could not compile regex: {e}"))?)
     } else {
         None
     };

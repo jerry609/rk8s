@@ -26,7 +26,7 @@ cargo.rust_library(
         "CARGO_PKG_VERSION_PRE": "",
     },
     named_deps = {
-        "hyper_util": "//third-party/rust/crates/hyper-util/0.1.16:hyper-util-0.1.16",
+        "hyper_util": "//third-party/rust/crates/hyper-util/0.1.17:hyper-util-0.1.17",
         "pin_project_lite": "//third-party/rust/crates/pin-project-lite/0.2.16:pin-project-lite-0.2.16",
         "tower_service": "//third-party/rust/crates/tower-service/0.3.3:tower-service-0.3.3",
     },

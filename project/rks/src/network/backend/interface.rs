@@ -126,7 +126,7 @@ fn validate_interface(interface: &ExternalInterface) -> Result<()> {
     // Validate that the interface is suitable for host-gw backend
     let mtu = interface.iface.mtu.unwrap_or(1500);
     if mtu < 1280 {
-        return Err(anyhow!("Interface MTU {} is too small, minimum 1280", mtu));
+        return Err(anyhow!("Interface MTU {mtu} is too small, minimum 1280"));
     }
 
     let iface_addr = interface
@@ -156,9 +156,7 @@ pub fn check_hostgw_compatibility(interface: &ExternalInterface) -> Result<()> {
         (Some(ext_addr), Some(iface_addr)) => {
             if ext_addr != iface_addr {
                 return Err(anyhow!(
-                    "Your PublicIP ({}) differs from interface IP ({}), meaning that probably you're on a NAT, which is not supported by host-gw backend",
-                    ext_addr,
-                    iface_addr
+                    "Your PublicIP ({ext_addr}) differs from interface IP ({iface_addr}), meaning that probably you're on a NAT, which is not supported by host-gw backend"
                 ));
             }
         }

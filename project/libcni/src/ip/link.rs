@@ -17,7 +17,7 @@ use rtnetlink::{Handle, RouteMessageBuilder, new_connection};
 /// Returns `Ok(Some(Handle))` if successful, or an error otherwise.
 pub fn get_handle() -> anyhow::Result<Option<Handle>> {
     let (connection, handle, _) =
-        new_connection().map_err(|e| anyhow!("Failed to create rtnetlink connection: {}", e))?;
+        new_connection().map_err(|e| anyhow!("Failed to create rtnetlink connection: {e}"))?;
     tokio::spawn(connection);
     Ok(Some(handle))
 }
@@ -39,7 +39,7 @@ pub async fn link_by_index(index: u32) -> anyhow::Result<LinkMessage> {
     let link = links
         .try_next()
         .await?
-        .ok_or_else(|| anyhow!("Link with index {} not found", index))?;
+        .ok_or_else(|| anyhow!("Link with index {index} not found"))?;
 
     Ok(link)
 }
@@ -61,7 +61,7 @@ pub async fn link_by_name(name: &str) -> anyhow::Result<LinkMessage> {
     let link = links
         .try_next()
         .await?
-        .ok_or_else(|| anyhow!("Link with name {} not found", name))?;
+        .ok_or_else(|| anyhow!("Link with name {name} not found"))?;
 
     Ok(link)
 }
@@ -129,7 +129,7 @@ pub async fn set_port_link(msg: LinkMessage) -> anyhow::Result<()> {
         .set_port(msg)
         .execute()
         .await
-        .map_err(|e| anyhow!("Failed to set port link: {}", e))?;
+        .map_err(|e| anyhow!("Failed to set port link: {e}"))?;
 
     Ok(())
 }
@@ -151,7 +151,7 @@ pub async fn link_set_up(link: &LinkMessage) -> anyhow::Result<()> {
 
     set_link(msg)
         .await
-        .map_err(|e| anyhow!("Failed to set up: {}", e))?;
+        .map_err(|e| anyhow!("Failed to set up: {e}"))?;
     Ok(())
 }
 
@@ -172,7 +172,7 @@ pub async fn link_set_down(link: &LinkMessage) -> anyhow::Result<()> {
 
     set_link(msg)
         .await
-        .map_err(|e| anyhow!("Failed to set down: {}", e))?;
+        .map_err(|e| anyhow!("Failed to set down: {e}"))?;
     Ok(())
 }
 
@@ -193,7 +193,7 @@ pub async fn link_set_master(link: &LinkMessage, master: &LinkMessage) -> anyhow
 
     set_link(msg)
         .await
-        .map_err(|e| anyhow!("Failed to set master: {}", e))?;
+        .map_err(|e| anyhow!("Failed to set master: {e}"))?;
     Ok(())
 }
 
@@ -216,7 +216,7 @@ pub async fn link_set_hairpin(link: &LinkMessage, enable: bool) -> anyhow::Resul
     msg.attributes.push(hairpin_attr);
     set_port_link(msg)
         .await
-        .map_err(|e| anyhow!("Failed to set hairpin: {}", e))?;
+        .map_err(|e| anyhow!("Failed to set hairpin: {e}"))?;
     Ok(())
 }
 
@@ -280,14 +280,14 @@ pub async fn route_del(route: Route) -> anyhow::Result<()> {
 
 // DelLinkByName removes an interface link.
 pub async fn del_link_by_name(if_name: &str) -> anyhow::Result<()> {
-    let link = link_by_name(if_name).await.map_err(|e| anyhow!("{}", e))?;
+    let link = link_by_name(if_name).await.map_err(|e| anyhow!("{e}"))?;
     del_link(link).await?;
     Ok(())
 }
 
 // DelLinkByNameAddr remove an interface and returns its addresses
 pub async fn del_link_by_name_addr(if_name: &str) -> anyhow::Result<Vec<Addr>> {
-    let link = link_by_name(if_name).await.map_err(|e| anyhow!("{}", e))?;
+    let link = link_by_name(if_name).await.map_err(|e| anyhow!("{e}"))?;
 
     let addr = addr::addr_list(link.header.index, AddressFamily::Inet).await?;
 

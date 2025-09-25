@@ -6,6 +6,7 @@ pub trait PluginInfo {
     fn encode<W: std::io::Write>(&self, w: W) -> ResultCNI<()>;
 }
 
+#[allow(dead_code)]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PluginInfoT {
     #[serde(rename = "cniVersion")]

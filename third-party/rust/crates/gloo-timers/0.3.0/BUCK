@@ -34,8 +34,8 @@ cargo.rust_library(
     named_deps = {
         "futures_channel": "//third-party/rust/crates/futures-channel/0.3.31:futures-channel-0.3.31",
         "futures_core": "//third-party/rust/crates/futures-core/0.3.31:futures-core-0.3.31",
-        "js_sys": "//third-party/rust/crates/js-sys/0.3.78:js-sys-0.3.78",
-        "wasm_bindgen": "//third-party/rust/crates/wasm-bindgen/0.2.101:wasm-bindgen-0.2.101",
+        "js_sys": "//third-party/rust/crates/js-sys/0.3.80:js-sys-0.3.80",
+        "wasm_bindgen": "//third-party/rust/crates/wasm-bindgen/0.2.103:wasm-bindgen-0.2.103",
     },
     visibility = ["PUBLIC"],
 )

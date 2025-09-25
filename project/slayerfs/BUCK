@@ -28,7 +28,7 @@ cargo.rust_binary(
     named_deps = {
         "async_trait": "//third-party/rust/crates/async-trait/0.1.89:async-trait-0.1.89",
         "aws_config": "//third-party/rust/crates/aws-config/1.8.6:aws-config-1.8.6",
-        "aws_sdk_s3": "//third-party/rust/crates/aws-sdk-s3/1.105.0:aws-sdk-s3-1.105.0",
+        "aws_sdk_s3": "//third-party/rust/crates/aws-sdk-s3/1.106.0:aws-sdk-s3-1.106.0",
         "futures_util": "//third-party/rust/crates/futures-util/0.3.31:futures-util-0.3.31",
     },
     visibility = ["PUBLIC"],
@@ -72,7 +72,7 @@ cargo.rust_library(
     named_deps = {
         "async_trait": "//third-party/rust/crates/async-trait/0.1.89:async-trait-0.1.89",
         "aws_config": "//third-party/rust/crates/aws-config/1.8.6:aws-config-1.8.6",
-        "aws_sdk_s3": "//third-party/rust/crates/aws-sdk-s3/1.105.0:aws-sdk-s3-1.105.0",
+        "aws_sdk_s3": "//third-party/rust/crates/aws-sdk-s3/1.106.0:aws-sdk-s3-1.106.0",
         "futures_util": "//third-party/rust/crates/futures-util/0.3.31:futures-util-0.3.31",
     },
     visibility = ["PUBLIC"],

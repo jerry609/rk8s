@@ -26,13 +26,13 @@ cargo.rust_library(
         "CARGO_PKG_VERSION_PRE": "",
     },
     named_deps = {
-        "erased_serde": "//third-party/rust/crates/erased-serde/0.4.6:erased-serde-0.4.6",
+        "erased_serde": "//third-party/rust/crates/erased-serde/0.4.8:erased-serde-0.4.8",
         "typetag_impl": "//third-party/rust/crates/typetag-impl/0.2.20:typetag-impl-0.2.20",
     },
     visibility = ["PUBLIC"],
     deps = [
         "//third-party/rust/crates/inventory/0.3.21:inventory-0.3.21",
         "//third-party/rust/crates/once_cell/1.21.3:once_cell-1.21.3",
-        "//third-party/rust/crates/serde/1.0.219:serde-1.0.219",
+        "//third-party/rust/crates/serde/1.0.226:serde-1.0.226",
     ],
 )

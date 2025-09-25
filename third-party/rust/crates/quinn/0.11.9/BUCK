@@ -45,7 +45,7 @@ cargo.rust_library(
     visibility = ["PUBLIC"],
     deps = [
         "//third-party/rust/crates/bytes/1.10.1:bytes-1.10.1",
-        "//third-party/rust/crates/rustls/0.23.31:rustls-0.23.31",
+        "//third-party/rust/crates/rustls/0.23.32:rustls-0.23.32",
         "//third-party/rust/crates/socket2/0.6.0:socket2-0.6.0",
         "//third-party/rust/crates/thiserror/2.0.16:thiserror-2.0.16",
         "//third-party/rust/crates/tokio/1.47.1:tokio-1.47.1",

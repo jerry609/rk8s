@@ -32,6 +32,6 @@ cargo.rust_library(
     visibility = ["PUBLIC"],
     deps = [
         "//third-party/rust/crates/thiserror/2.0.16:thiserror-2.0.16",
-        "//third-party/rust/crates/time/0.3.43:time-0.3.43",
+        "//third-party/rust/crates/time/0.3.44:time-0.3.44",
     ],
 )

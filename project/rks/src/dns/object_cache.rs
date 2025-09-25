@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 #![allow(dead_code)]
 use std::net::Ipv4Addr;
 use std::{collections::HashMap, sync::Arc};
@@ -29,5 +28,11 @@ impl DnsObjectCache {
             service_cache: Arc::new(RwLock::new(HashMap::new())),
             pod_cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+}
+
+impl Default for DnsObjectCache {
+    fn default() -> Self {
+        Self::new()
     }
 }

@@ -58,7 +58,7 @@ cargo.rust_library(
     },
     visibility = ["PUBLIC"],
     deps = [
-        "//third-party/rust/crates/indexmap/2.11.1:indexmap-2.11.1",
+        "//third-party/rust/crates/indexmap/2.11.4:indexmap-2.11.4",
         "//third-party/rust/crates/slab/0.4.11:slab-0.4.11",
         "//third-party/rust/crates/sync_wrapper/1.0.2:sync_wrapper-1.0.2",
         "//third-party/rust/crates/tokio/1.47.1:tokio-1.47.1",

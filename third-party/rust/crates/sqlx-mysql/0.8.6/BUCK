@@ -65,7 +65,7 @@ cargo.rust_library(
         "//third-party/rust/crates/once_cell/1.21.3:once_cell-1.21.3",
         "//third-party/rust/crates/rand/0.8.5:rand-0.8.5",
         "//third-party/rust/crates/rsa/0.9.8:rsa-0.9.8",
-        "//third-party/rust/crates/serde/1.0.219:serde-1.0.219",
+        "//third-party/rust/crates/serde/1.0.226:serde-1.0.226",
         "//third-party/rust/crates/sha1/0.10.6:sha1-0.10.6",
         "//third-party/rust/crates/sha2/0.10.9:sha2-0.10.9",
         "//third-party/rust/crates/smallvec/1.15.1:smallvec-1.15.1",

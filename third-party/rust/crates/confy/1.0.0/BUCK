@@ -33,7 +33,7 @@ cargo.rust_library(
     visibility = ["PUBLIC"],
     deps = [
         "//third-party/rust/crates/directories/6.0.0:directories-6.0.0",
-        "//third-party/rust/crates/serde/1.0.219:serde-1.0.219",
+        "//third-party/rust/crates/serde/1.0.226:serde-1.0.226",
         "//third-party/rust/crates/thiserror/2.0.16:thiserror-2.0.16",
         "//third-party/rust/crates/toml/0.8.23:toml-0.8.23",
     ],

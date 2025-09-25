@@ -237,4 +237,92 @@ impl XlineStore {
             .await?;
         Ok(())
     }
+
+    /// List all service names (keys only, values are ignored).
+    pub async fn list_service_names(&self) -> Result<Vec<String>> {
+        let key = "/registry/services/".to_string();
+        let mut client = self.client.write().await;
+        let resp = client
+            .get(
+                key.clone(),
+                Some(GetOptions::new().with_prefix().with_keys_only()),
+            )
+            .await?;
+        Ok(resp
+            .kvs()
+            .iter()
+            .map(|kv| String::from_utf8_lossy(kv.key()).replace("/registry/services/", ""))
+            .collect())
+    }
+
+    /// List all services (deserialize values).
+    pub async fn list_services(&self) -> Result<Vec<ServiceTask>> {
+        let key = "/registry/services/".to_string();
+        let mut client = self.client.write().await;
+        let resp = client
+            .get(key.clone(), Some(GetOptions::new().with_prefix()))
+            .await?;
+
+        let services: Vec<ServiceTask> = resp
+            .kvs()
+            .iter()
+            .filter_map(|kv| {
+                let yaml_str = String::from_utf8_lossy(kv.value());
+                serde_yaml::from_str::<ServiceTask>(&yaml_str).ok()
+            })
+            .collect();
+
+        Ok(services)
+    }
+
+    /// Insert a service YAML definition into xline.
+    pub async fn insert_service_yaml(&self, service_name: &str, service_yaml: &str) -> Result<()> {
+        let key = format!("/registry/services/{service_name}");
+        let mut client = self.client.write().await;
+        client
+            .put(key, service_yaml, Some(PutOptions::new()))
+            .await?;
+        Ok(())
+    }
+
+    /// Get a service YAML definition from xline.
+    pub async fn get_service_yaml(&self, service_name: &str) -> Result<Option<String>> {
+        let key = format!("/registry/services/{service_name}");
+        let mut client = self.client.write().await;
+        let resp = client.get(key, None).await?;
+        Ok(resp
+            .kvs()
+            .first()
+            .map(|kv| String::from_utf8_lossy(kv.value()).to_string()))
+    }
+
+    /// Get a service object from xline.
+    pub async fn get_service(&self, service_name: &str) -> Result<Option<ServiceTask>> {
+        if let Some(yaml) = self.get_service_yaml(service_name).await? {
+            let service: ServiceTask = serde_yaml::from_str(&yaml)?;
+            Ok(Some(service))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Delete a service from xline.
+    pub async fn delete_service(&self, service_name: &str) -> Result<()> {
+        let key = format!("/registry/services/{service_name}");
+        let mut client = self.client.write().await;
+        client.delete(key, None).await?;
+        Ok(())
+    }
+
+    /// Create a watch on all pods with prefix `/registry/services/`, starting from a given revision.
+    pub async fn watch_services(&self, start_rev: i64) -> Result<(Watcher, WatchStream)> {
+        let key_prefix = "/registry/services/".to_string();
+        let opts = WatchOptions::new()
+            .with_prefix()
+            .with_prev_key()
+            .with_start_revision(start_rev);
+        let mut client = self.client.write().await;
+        let (watcher, stream) = client.watch(key_prefix, Some(opts)).await?;
+        Ok((watcher, stream))
+    }
 }

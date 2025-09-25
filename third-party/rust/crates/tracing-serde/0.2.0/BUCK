@@ -29,5 +29,5 @@ cargo.rust_library(
         "tracing_core": "//third-party/rust/crates/tracing-core/0.1.34:tracing-core-0.1.34",
     },
     visibility = ["PUBLIC"],
-    deps = ["//third-party/rust/crates/serde/1.0.219:serde-1.0.219"],
+    deps = ["//third-party/rust/crates/serde/1.0.226:serde-1.0.226"],
 )

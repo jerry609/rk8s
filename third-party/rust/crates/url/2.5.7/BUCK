@@ -37,6 +37,6 @@ cargo.rust_library(
     deps = [
         "//third-party/rust/crates/form_urlencoded/1.2.2:form_urlencoded-1.2.2",
         "//third-party/rust/crates/idna/1.1.0:idna-1.1.0",
-        "//third-party/rust/crates/serde/1.0.219:serde-1.0.219",
+        "//third-party/rust/crates/serde/1.0.226:serde-1.0.226",
     ],
 )

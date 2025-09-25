@@ -59,7 +59,7 @@ cargo.rust_binary(
     features = ["prebuilt-nasm"],
     visibility = [],
     deps = [
-        "//third-party/rust/crates/cc/1.2.36:cc-1.2.36",
+        "//third-party/rust/crates/cc/1.2.38:cc-1.2.38",
         "//third-party/rust/crates/cmake/0.1.54:cmake-0.1.54",
         "//third-party/rust/crates/dunce/1.0.5:dunce-1.0.5",
         "//third-party/rust/crates/fs_extra/1.3.0:fs_extra-1.3.0",

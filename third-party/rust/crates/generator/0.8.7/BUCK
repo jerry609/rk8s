@@ -61,7 +61,7 @@ cargo.rust_binary(
     },
     visibility = [],
     deps = [
-        "//third-party/rust/crates/cc/1.2.36:cc-1.2.36",
+        "//third-party/rust/crates/cc/1.2.38:cc-1.2.38",
         "//third-party/rust/crates/rustversion/1.0.22:rustversion-1.0.22",
     ],
 )

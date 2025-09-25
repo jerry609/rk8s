@@ -161,7 +161,7 @@ pub async fn setup_veth(
     netns::exec_netns(&current_ns, host_ns, async {
         let link = link::link_by_name(&host_inf_name)
             .await
-            .map_err(|e| anyhow!("{}", e))?;
+            .map_err(|e| anyhow!("{e}"))?;
 
         link::link_set_up(&link).await
     })
@@ -272,7 +272,7 @@ async fn make_veth_pair(
     }
     link::add_link(builder.build())
         .await
-        .map_err(|e| anyhow!("Failed to add link: {}", e))?;
+        .map_err(|e| anyhow!("Failed to add link: {e}"))?;
 
     Ok(veth)
 }

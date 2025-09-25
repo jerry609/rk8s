@@ -54,7 +54,7 @@ cargo.rust_library(
         "//third-party/rust/crates/ring/0.17.14:ring-0.17.14",
         "//third-party/rust/crates/sha2/0.10.9:sha2-0.10.9",
         "//third-party/rust/crates/subtle/2.6.1:subtle-2.6.1",
-        "//third-party/rust/crates/time/0.3.43:time-0.3.43",
+        "//third-party/rust/crates/time/0.3.44:time-0.3.44",
         "//third-party/rust/crates/tracing/0.1.41:tracing-0.1.41",
         "//third-party/rust/crates/zeroize/1.8.1:zeroize-1.8.1",
     ],
