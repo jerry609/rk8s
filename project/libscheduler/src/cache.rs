@@ -46,13 +46,14 @@ impl Cache {
         } else {
             return false;
         };
+
         pod_info.scheduled = Some(node_name.to_owned());
         node.requested.cpu += pod_info.spec.resources.cpu;
         node.requested.memory += pod_info.spec.resources.memory;
+
         true
     }
 
-    /// Un assume a pod, if the pod is not scheduled, do nothing.
     pub fn unassume(&mut self, pod_name: &str) -> Option<PodInfo> {
         let pod_info = self.pods.get_mut(pod_name)?;
         let node_name_opt = pod_info.scheduled.clone();
@@ -61,9 +62,11 @@ impl Cache {
         } else {
             return None;
         };
+
         pod_info.scheduled = None;
         node.requested.cpu -= pod_info.spec.resources.cpu;
         node.requested.memory -= pod_info.spec.resources.memory;
+
         Some(pod_info.clone())
     }
 
@@ -74,14 +77,26 @@ impl Cache {
     pub fn remove_pod(&mut self, pod_name: &str) -> Option<PodInfo> {
         if let Some(p) = self.pods.get(pod_name)
             && let Some(n) = &p.scheduled
+            && let Some(node) = self.nodes.get_mut(n)
         {
-            let node = self.nodes.get_mut(n);
-            if let Some(node) = node {
-                node.requested.cpu -= p.spec.resources.cpu;
-                node.requested.memory -= p.spec.resources.memory;
-            }
+            node.requested.cpu -= p.spec.resources.cpu;
+            node.requested.memory -= p.spec.resources.memory;
         }
         self.pods.remove(pod_name)
+    }
+
+    pub fn update_node(&mut self, new_node: NodeInfo) -> Option<NodeInfo> {
+        let name = new_node.name.clone();
+        if let Some(old_node) = self.nodes.get_mut(&name) {
+            let requested = old_node.requested.clone();
+            old_node.labels = new_node.labels;
+            old_node.spec = new_node.spec;
+            old_node.allocatable = new_node.allocatable;
+            old_node.requested = requested;
+            Some(old_node.clone())
+        } else {
+            self.nodes.insert(name.clone(), new_node)
+        }
     }
 
     pub fn pop_pod_on_node(&mut self, node_name: &str) -> Vec<PodNameWithPriority> {
@@ -95,10 +110,6 @@ impl Cache {
                 res.push((p.spec.priority, p.name.clone()));
             });
         res
-    }
-
-    pub fn update_node(&mut self, node: NodeInfo) -> Option<NodeInfo> {
-        self.nodes.insert(node.name.clone(), node)
     }
 
     pub fn remove_node(&mut self, node_name: &str) {

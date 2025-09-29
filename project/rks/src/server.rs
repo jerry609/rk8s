@@ -6,8 +6,8 @@ use crate::network::{lease::LeaseWatchResult, manager::LocalManager};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use common::{
-    ConditionStatus, Node, NodeCondition, NodeConditionType, NodeNetworkConfig, PodTask,
-    RksMessage,
+    ConditionStatus, Node, NodeCondition, NodeConditionType, NodeNetworkConfig, NodeStatus,
+    PodTask, RksMessage, Taint, TaintEffect, TaintKey,
     lease::{Lease, LeaseAttrs},
 };
 use futures_util::StreamExt;
@@ -187,12 +187,38 @@ async fn watch_pods(
                     match event.event_type() {
                         etcd_client::EventType::Put => {
                             if let Some(kv) = event.kv() {
-                                watch_create(
-                                    String::from_utf8_lossy(kv.value()).to_string(),
-                                    conn,
-                                    &node_id,
-                                )
-                                .await?;
+                                let new_pod: PodTask = serde_yaml::from_slice(kv.value())?;
+                                if let Some(prev_kv) = event.prev_kv() {
+                                    let prev_pod: PodTask =
+                                        serde_yaml::from_slice(prev_kv.value())?;
+                                    // Only updating node_name can be watched and send to node
+                                    if prev_pod.spec.node_name.is_none()
+                                        && new_pod.spec.node_name.is_some()
+                                    {
+                                        info!(
+                                            "[watch_pods] Pod {} assigned to {:?}",
+                                            new_pod.metadata.name, new_pod.spec.node_name
+                                        );
+                                        watch_create(
+                                            String::from_utf8_lossy(kv.value()).to_string(),
+                                            conn,
+                                            &node_id,
+                                        )
+                                        .await?;
+                                    }
+                                } else {
+                                    // If the nodename is assigned at first, be watched by node
+                                    info!(
+                                        "[watch_pods] Pod {} assigned to {:?}",
+                                        new_pod.metadata.name, new_pod.spec.node_name
+                                    );
+                                    watch_create(
+                                        String::from_utf8_lossy(kv.value()).to_string(),
+                                        conn,
+                                        &node_id,
+                                    )
+                                    .await?;
+                                }
                             }
                         }
                         etcd_client::EventType::Delete => {
@@ -403,11 +429,8 @@ async fn dispatch_worker(
     xline_store: &Arc<XlineStore>,
 ) -> Result<()> {
     match msg {
-        RksMessage::Heartbeat {
-            node_name,
-            conditions,
-        } => {
-            handle_heartbeat(xline_store, &node_name, conditions).await?;
+        RksMessage::Heartbeat { node_name, status } => {
+            handle_heartbeat(xline_store, &node_name, status).await?;
             let response = RksMessage::Ack;
             let res = bincode::serialize(&response)?;
             if let Ok(mut stream) = conn.open_uni().await {
@@ -417,6 +440,23 @@ async fn dispatch_worker(
         }
         RksMessage::Error(err_msg) => error!("[worker dispatch] reported error: {err_msg}"),
         RksMessage::Ack => info!("[worker dispatch] received Ack"),
+        RksMessage::SetPodip((pod_name, pod_ip)) => {
+            if let Some(pod_yaml) = xline_store.get_pod_yaml(&pod_name).await? {
+                let mut pod: PodTask = serde_yaml::from_str(&pod_yaml)?;
+                pod.status.pod_ip = Some(pod_ip.clone());
+                let new_yaml = serde_yaml::to_string(&pod)?;
+                xline_store.insert_pod_yaml(&pod_name, &new_yaml).await?;
+                info!(
+                    "[worker dispatch] updated Pod {} with IP {}",
+                    pod_name, pod_ip
+                );
+            } else {
+                warn!(
+                    "[worker dispatch] Pod {} not found when setting IP",
+                    pod_name
+                );
+            }
+        }
         _ => warn!("[worker dispatch] unknown or unexpected message from worker"),
     }
     Ok(())
@@ -530,21 +570,23 @@ pub fn build_node_network_config(
 async fn handle_heartbeat(
     xline_store: &Arc<XlineStore>,
     node_name: &str,
-    conditions: Vec<NodeCondition>,
+    status: NodeStatus,
 ) -> Result<()> {
     if let Some(node_yaml) = xline_store.get_node_yaml(node_name).await? {
         let mut node: Node = serde_yaml::from_str(&node_yaml)?;
-        node.status.conditions = conditions;
+        node.status = status;
+        node.spec.taints = convert_conditions_to_taints(&node.status.conditions);
         let new_yaml = serde_yaml::to_string(&node)?;
         xline_store.insert_node_yaml(node_name, &new_yaml).await?;
-        info!("[worker dispatch] heartbeat from {node_name}");
+        info!("[worker dispatch] heartbeat updated Node {}", node_name);
     } else {
-        warn!("[server] heartbeat received for unknown node: {node_name}");
+        warn!(
+            "[server] heartbeat received for unknown node: {}",
+            node_name
+        );
     }
-
     Ok(())
 }
-
 fn watch_heartbeat(xline_store: Arc<XlineStore>, grace: Duration, interval: Duration) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -578,7 +620,8 @@ fn watch_heartbeat(xline_store: Arc<XlineStore>, grace: Duration, interval: Dura
                         if expired && !matches!(ready.status, ConditionStatus::Unknown) {
                             ready.status = ConditionStatus::Unknown;
                             ready.last_heartbeat_time = Some(Utc::now().to_rfc3339());
-
+                            node.spec.taints =
+                                convert_conditions_to_taints(&node.status.conditions);
                             if let Ok(new_yaml) = serde_yaml::to_string(&node) {
                                 if let Err(e) =
                                     xline_store.insert_node_yaml(&node_id, &new_yaml).await
@@ -588,10 +631,78 @@ fn watch_heartbeat(xline_store: Arc<XlineStore>, grace: Duration, interval: Dura
                                     warn!("Node {node_id} marked Ready=Unknown (timeout)");
                                 }
                             }
+                            evict_pods_for_node(&node_id, xline_store.clone()).await;
                         }
                     }
                 }
             }
         }
     });
+}
+
+fn convert_conditions_to_taints(conditions: &[NodeCondition]) -> Vec<Taint> {
+    let mut taints = Vec::new();
+    for cond in conditions {
+        match cond.condition_type {
+            NodeConditionType::Ready => {
+                if matches!(
+                    cond.status,
+                    ConditionStatus::False | ConditionStatus::Unknown
+                ) {
+                    taints.push(Taint::new(TaintKey::NodeNotReady, TaintEffect::NoExecute));
+                }
+            }
+            NodeConditionType::MemoryPressure => {
+                if matches!(cond.status, ConditionStatus::True) {
+                    taints.push(Taint::new(
+                        TaintKey::NodeMemoryPressure,
+                        TaintEffect::NoSchedule,
+                    ));
+                }
+            }
+            NodeConditionType::DiskPressure => {
+                if matches!(cond.status, ConditionStatus::True) {
+                    taints.push(Taint::new(
+                        TaintKey::NodeDiskPressure,
+                        TaintEffect::NoSchedule,
+                    ));
+                }
+            }
+            NodeConditionType::NetworkUnavailable => {
+                if matches!(cond.status, ConditionStatus::True) {
+                    taints.push(Taint::new(
+                        TaintKey::NodeNetworkUnavailable,
+                        TaintEffect::NoSchedule,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    taints
+}
+
+/// Evict all pods running on a given node if they don't tolerate NoExecute taints.
+pub async fn evict_pods_for_node(node_id: &str, xline_store: Arc<XlineStore>) {
+    if let Ok(pods) = xline_store.list_pod_names().await {
+        for pod_name in pods {
+            if let Some(pod_yaml) = xline_store.get_pod_yaml(&pod_name).await.unwrap_or(None)
+                && let Ok(pod) = serde_yaml::from_str::<PodTask>(&pod_yaml)
+                && pod.spec.node_name.as_deref() == Some(node_id)
+            {
+                let taint = Taint::new(TaintKey::NodeNotReady, TaintEffect::NoExecute);
+
+                // Check if pod has a matching toleration
+                let has_toleration = pod.spec.tolerations.iter().any(|tol| tol.tolerate(&taint));
+
+                // Evict if no toleration found
+                if !has_toleration {
+                    info!("Evicting pod {} from node {}", pod.metadata.name, node_id);
+                    if let Err(e) = xline_store.delete_pod(&pod.metadata.name).await {
+                        error!("Failed to evict pod {}: {:?}", pod.metadata.name, e);
+                    }
+                }
+            }
+        }
+    }
 }
