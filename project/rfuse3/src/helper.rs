@@ -4,6 +4,17 @@ use bincode::{DefaultOptions, Options};
 use nix::sys::stat::mode_t;
 
 use crate::FileType;
+pub trait Apply: Sized {
+    fn apply<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(&mut Self),
+    {
+        f(&mut self);
+        self
+    }
+}
+
+impl<T> Apply for T {}
 
 #[inline]
 pub fn get_first_null_position(data: impl AsRef<[u8]>) -> Option<usize> {
