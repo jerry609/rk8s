@@ -34,16 +34,19 @@ pub enum User {
 
 /// Get the username of the user who invoked `sudo`.
 pub fn original_user_name() -> User {
+    if let Ok(user) = std::env::var("SUDO_USER") {
+        return User::Normal(user);
+    }
+
+    if let Ok(user) = std::env::var("LOGNAME") {
+        return User::Normal(user);
+    }
+
     // `logname` command will return this directly if it is usable, which is in coreutils.
     // `logname` -> `me`
     // `sudo logname` -> `me`
     if let Ok(output) = Command::new("logname").output() {
         return User::Normal(String::from_utf8_lossy(&output.stdout).trim().to_string());
-    }
-
-    // Backup plan
-    if let Ok(user) = std::env::var("SUDO_USER") {
-        return User::Normal(user);
     }
 
     User::Root

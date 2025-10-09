@@ -4,7 +4,7 @@ use crate::{
         compose::network::{BRIDGE_CONF, CliNetworkConfig, STD_CONF_PATH},
         container::config::ContainerConfigBuilder,
         create, delete, exec, list, load_container, start,
-        utils::{ImageType, determine_image_path, get_bundle_from_path, handle_oci_image},
+        utils::{ImageType, determine_image, get_bundle_from_image_ref, handle_oci_image},
     },
     cri::cri_api::{ContainerConfig, CreateContainerResponse, Mount},
     rootpath,
@@ -96,7 +96,7 @@ impl ContainerRunner {
 
         let builder = handle_image_typ(&spec)?;
         if builder.is_some() {
-            spec.image = get_bundle_from_path(spec.image)?
+            spec.image = get_bundle_from_image_ref(spec.image)?
                 .to_str()
                 .unwrap_or_default()
                 .to_string();
@@ -126,7 +126,7 @@ impl ContainerRunner {
 
         let builder = handle_image_typ(&container_spec)?;
         if builder.is_some() {
-            container_spec.image = get_bundle_from_path(container_spec.image)?
+            container_spec.image = get_bundle_from_image_ref(container_spec.image)?
                 .to_str()
                 .unwrap_or_default()
                 .to_string();
@@ -623,7 +623,7 @@ pub fn setup_network_conf() -> Result<()> {
 pub fn handle_image_typ(container_spec: &ContainerSpec) -> Result<Option<ContainerConfigBuilder>> {
     // TODO: MVP
     // check if the image path
-    if let ImageType::OCIImage = determine_image_path(&container_spec.image)? {
+    if let ImageType::OCIImage = determine_image(&container_spec.image)? {
         let image_config = handle_oci_image(&container_spec.image, container_spec.name.clone())?;
         // handle image_config
         let mut builder = ContainerConfigBuilder::default();

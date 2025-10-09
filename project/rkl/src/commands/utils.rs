@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Ok, Result, anyhow, bail};
 use oci_spec::image::{ImageConfiguration, ImageManifest, MediaType};
 use thiserror::Error;
 use tracing::debug;
@@ -23,6 +23,24 @@ pub enum UtilsError {
     InvalidImagePath,
 }
 
+pub fn get_manifest_from_image_ref(image_ref: impl AsRef<str>) -> Result<String> {
+    let (manifest_path, _) = rkb::pull::pull_or_get_image(image_ref, None::<&str>)
+        .map_err(|e| anyhow!("failed to pull image: {e}"))?;
+
+    manifest_path
+        .file_name()
+        .map(|str| str.to_str().unwrap_or("unknown").to_string())
+        .with_context(|| anyhow!("failed to get manifest hash"))
+}
+
+pub fn get_bundle_from_image_ref(image_ref: impl AsRef<str>) -> Result<PathBuf> {
+    let manifest_hash = get_manifest_from_image_ref(image_ref)?;
+    Ok(PathBuf::from(format!(
+        "{RKL_IMAGE_REGISTRY}/{manifest_hash}"
+    )))
+}
+
+#[allow(dead_code)]
 pub fn get_bundle_from_path<P: AsRef<Path>>(image_path: P) -> Result<PathBuf> {
     let index = oci_spec::image::ImageIndex::from_file(image_path.as_ref().join("index.json"))
         .map_err(|e| anyhow!("failed to get index.json in image dir: {}", e))?;
@@ -42,52 +60,51 @@ pub fn get_bundle_from_path<P: AsRef<Path>>(image_path: P) -> Result<PathBuf> {
     )))
 }
 
-pub fn handle_oci_image<P: AsRef<Path>>(image: P, _name: String) -> Result<ImageConfiguration> {
-    // read the image's manifest
-    let index = oci_spec::image::ImageIndex::from_file(image.as_ref().join("index.json"))
-        .map_err(|e| anyhow!("failed to get index.json in image dir: {}", e))?;
+/// pull image from rkb's implementation
+pub fn handle_oci_image(image_ref: impl AsRef<str>, _name: String) -> Result<ImageConfiguration> {
+    let (manifest_path, layers) = rkb::pull::pull_or_get_image(image_ref, None::<&str>)
+        .map_err(|e| anyhow!("failed to pull image: {e}"))?;
 
-    let image_manifest_descriptor = index
-        .manifests()
-        .iter()
-        .find(|descriptor| matches!(descriptor.media_type(), MediaType::ImageManifest))
-        .with_context(|| anyhow!("Failed to get image manifest descriptor"))?;
+    debug!("get manifest_path: {manifest_path:?}");
+    debug!("layers: {layers:?}");
 
-    let image_manifest_hash = image_manifest_descriptor
-        .as_digest_sha256()
-        .unwrap_or_default();
+    let manifest_hash = manifest_path
+        .file_name()
+        .map(|str| str.to_str().unwrap_or("unknown").to_string())
+        .with_context(|| anyhow!("failed to get manifest hash"))?;
 
-    debug!("image_manifest_hash: {image_manifest_hash}");
+    let bundle_path = format!("{RKL_IMAGE_REGISTRY}/{manifest_hash}");
+    let config = get_image_config(&manifest_path)?;
 
-    if let Some(digest) = image_manifest_descriptor.as_digest_sha256() {
-        debug!("digest: {digest}");
-        let bundle_path = PathBuf::from(format!("{RKL_IMAGE_REGISTRY}/{digest}"));
-        if bundle_path.exists() {
-            let image_path = image.as_ref().join("blobs/sha256");
-
-            let image_manifest_path = image_path.join(digest);
-            let image_manifest = ImageManifest::from_file(image_manifest_path)
-                .with_context(|| "Failed to read manifest.json")?;
-
-            let image_config_hash = image_manifest
-                .config()
-                .as_digest_sha256()
-                .with_context(|| "Failed to get digest from config descriptor")?;
-            let image_config_path = image_path.join(image_config_hash);
-            let image_config = ImageConfiguration::from_file(&image_config_path)
-                .with_context(|| "Failed to read config.json")?;
-            return Ok(image_config);
-        }
+    if PathBuf::from(&bundle_path).exists() {
+        return Ok(config);
     }
 
     tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(bundle::convert_image_to_bundle(
-            image,
-            format!("{RKL_IMAGE_REGISTRY}/{image_manifest_hash}"),
-        ))
+        .block_on(bundle::mount_and_copy_bundle(bundle_path, &layers))?;
+    Ok(config)
 }
 
+pub fn get_image_config(manifest_path: impl AsRef<Path>) -> Result<ImageConfiguration> {
+    let digest = ImageManifest::from_file(manifest_path.as_ref())?
+        .config()
+        .digest()
+        .digest()
+        .to_string();
+
+    let dir = manifest_path.as_ref().parent().unwrap().join(digest);
+    ImageConfiguration::from_file(dir).map_err(|e| anyhow!("failed to get image config: {e}"))
+}
+
+pub fn determine_image(target: impl AsRef<str>) -> Result<ImageType> {
+    match PathBuf::from(target.as_ref()).exists() {
+        true => Ok(ImageType::Bundle),
+        false => Ok(ImageType::OCIImage),
+    }
+}
+
+#[allow(dead_code)]
 pub fn determine_image_path<P: AsRef<Path>>(target: P) -> Result<ImageType> {
     if !target.as_ref().is_dir() {
         bail!("invalid image path")

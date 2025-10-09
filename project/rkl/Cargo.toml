@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 common = { path = "../common" }
 libnetwork = { path = "../libnetwork", version = "0.1.0" }
+rkb = { path = "../rkb", version = "0.1.0" }
 libcgroups = { path = "../libcgroups", version = "0.5.1" }
 libcontainer = { path = "../libcontainer", version = "0.5.1" }
 clap = { version = "4.5", features = ["derive"] }

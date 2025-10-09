@@ -5476,6 +5476,7 @@ dependencies = [
  "protobuf",
  "quinn",
  "regex",
+ "rkb",
  "rustls 0.23.32",
  "scopeguard",
  "serde",

@@ -202,7 +202,7 @@ async fn extract_tar_gz<P: AsRef<Path>>(tar_gz_path: P, extract_dir: P) -> anyho
 }
 
 #[allow(unused)]
-async fn mount_and_copy_bundle<P: AsRef<Path>>(
+pub async fn mount_and_copy_bundle<P: AsRef<Path>>(
     bundle_path: P,
     layers: &Vec<PathBuf>,
 ) -> anyhow::Result<()> {
