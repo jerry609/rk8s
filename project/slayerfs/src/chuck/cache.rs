@@ -13,6 +13,7 @@ use sea_orm::sea_query::WindowSelectType;
 use sha2::{Digest, Sha256, digest::KeyInit};
 use tokio::fs;
 use tokio::sync::RwLock;
+use tracing::{debug, error, info, trace, warn};
 
 /// Configuration for the intelligent dual-layer cache system.
 ///
@@ -190,8 +191,13 @@ struct DiskStorage {
 impl DiskStorage {
     pub async fn new<P: AsRef<Path>>(base_dir: P) -> anyhow::Result<Self> {
         let base_dir = base_dir.as_ref().to_path_buf();
+        debug!("Initializing disk storage at: {:?}", base_dir);
+
         if !base_dir.exists() {
+            info!("Creating cache directory: {:?}", base_dir);
             fs::create_dir_all(&base_dir).await?;
+        } else {
+            debug!("Cache directory already exists: {:?}", base_dir);
         }
 
         Ok(Self { base_dir })
@@ -208,8 +214,21 @@ impl DiskStorage {
     pub async fn store(&self, key: &str, data: impl AsRef<[u8]>) -> anyhow::Result<()> {
         let filename = Self::key_to_filename(key);
         let filepath = self.base_dir.join(filename);
+        let data_bytes = data.as_ref();
 
-        tokio::fs::write(filepath, data).await?;
+        trace!(
+            "Storing {} bytes for key '{}' to file: {:?}",
+            data_bytes.len(),
+            key,
+            filepath
+        );
+
+        tokio::fs::write(filepath, data_bytes).await?;
+        debug!(
+            "Successfully stored data for key '{}', size: {} bytes",
+            key,
+            data_bytes.len()
+        );
         Ok(())
     }
 
@@ -217,12 +236,26 @@ impl DiskStorage {
         let filename = Self::key_to_filename(key);
         let filepath = self.base_dir.join(filename);
 
+        trace!("Loading data for key '{}' from file: {:?}", key, filepath);
+
         if !filepath.exists() {
+            trace!("File does not exist for key '{}': {:?}", key, filepath);
             return Err(anyhow!("file {} does not exist", filepath.display()));
         }
+
         match tokio::fs::read(filepath).await {
-            Ok(data) => Ok(data),
-            Err(e) => Err(e.into()),
+            Ok(data) => {
+                debug!(
+                    "Successfully loaded data for key '{}', size: {} bytes",
+                    key,
+                    data.len()
+                );
+                Ok(data)
+            }
+            Err(e) => {
+                error!("Failed to load data for key '{}': {}", key, e);
+                Err(e.into())
+            }
         }
     }
 
@@ -231,12 +264,25 @@ impl DiskStorage {
         let filename = Self::key_to_filename(key);
         let filepath = self.base_dir.join(filename);
 
+        trace!("Removing file for key '{}': {:?}", key, filepath);
+
         if !filepath.exists() {
+            warn!(
+                "Attempted to remove non-existent file for key '{}': {:?}",
+                key, filepath
+            );
             return Err(anyhow!("file {} does not exist", filepath.display()));
         }
+
         match tokio::fs::remove_file(filepath).await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e.into()),
+            Ok(_) => {
+                debug!("Successfully removed file for key '{}'", key);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to remove file for key '{}': {}", key, e);
+                Err(e.into())
+            }
         }
     }
 }
@@ -349,6 +395,12 @@ impl AccessStats {
         let medium_bucket_duration_secs = 5u64;
         let medium_bucket_count =
             (medium_window_size.as_secs() / medium_bucket_duration_secs).clamp(12, 180) as usize;
+
+        debug!(
+            "Creating AccessStats: short_window={:?} ({} buckets), medium_window={:?} ({} buckets)",
+            short_window_size, short_bucket_count, medium_window_size, medium_bucket_count
+        );
+
         let short_buckets = (0..short_bucket_count)
             .map(|_| AtomicU64::new(0))
             .collect::<Vec<_>>()
@@ -386,18 +438,30 @@ impl AccessStats {
             .unwrap()
             .as_secs();
 
+        trace!("Recording access at timestamp: {}", now);
+
         // Update last access time
         self.last_update.store(now, Ordering::Relaxed);
 
         // Record in short window
         self.maybe_reset_short_bucket(now);
         let short_bucket_idx = self.calculate_short_bucket_index(now);
-        self.short_buckets[short_bucket_idx].fetch_add(1, Ordering::Relaxed);
+        let short_count = self.short_buckets[short_bucket_idx].fetch_add(1, Ordering::Relaxed);
+        trace!(
+            "Recorded in short bucket {}: count = {}",
+            short_bucket_idx,
+            short_count + 1
+        );
 
         // Record in medium window
         self.maybe_reset_medium_bucket(now);
         let medium_bucket_idx = self.calculate_medium_bucket_index(now);
-        self.medium_buckets[medium_bucket_idx].fetch_add(1, Ordering::Relaxed);
+        let medium_count = self.medium_buckets[medium_bucket_idx].fetch_add(1, Ordering::Relaxed);
+        trace!(
+            "Recorded in medium bucket {}: count = {}",
+            medium_bucket_idx,
+            medium_count + 1
+        );
     }
 
     /// Get weighted access frequency using both short and medium windows
@@ -408,12 +472,19 @@ impl AccessStats {
         // Normalize weights
         let total_weight = short_weight + medium_weight;
         if total_weight == 0.0 {
+            trace!("Both weights are 0, returning 0 frequency");
             return 0.0;
         }
         let short_norm = short_weight / total_weight;
         let medium_norm = medium_weight / total_weight;
 
-        short_freq * short_norm + medium_freq * medium_norm
+        let weighted_freq = short_freq * short_norm + medium_freq * medium_norm;
+        trace!(
+            "Weighted frequency: short={} ({:.2}), medium={} ({:.2}) -> weighted={:.2}",
+            short_freq, short_norm, medium_freq, medium_norm, weighted_freq
+        );
+
+        weighted_freq
     }
 
     /// Get short window access frequency
@@ -627,6 +698,7 @@ struct SystemMetrics {
 
 impl SystemMetrics {
     fn new() -> Self {
+        debug!("Initializing SystemMetrics with 60 request buckets");
         Self {
             hit_rate: AtomicU64::new(0),
             total_requests: AtomicU64::new(0),
@@ -639,10 +711,17 @@ impl SystemMetrics {
     }
 
     fn record_request(&self, hit: bool) {
-        self.total_requests.fetch_add(1, Ordering::Relaxed);
-        if hit {
-            self.cache_hits.fetch_add(1, Ordering::Relaxed);
-        }
+        let total = self.total_requests.fetch_add(1, Ordering::Relaxed) + 1;
+        let hits = if hit {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            self.cache_hits.load(Ordering::Relaxed)
+        };
+
+        trace!(
+            "Recording cache request: hit={}, total_requests={}, cache_hits={}",
+            hit, total, hits
+        );
 
         // Update sliding window request tracking
         self.advance_request_buckets();
@@ -831,6 +910,14 @@ impl Policy {
         aggressive_promotion_load_threshold: f64,
         conservative_promotion_hit_rate_threshold: f64,
     ) -> Self {
+        info!(
+            "Creating Policy with configuration: base_threshold={:.2}, short_weight={:.2}, medium_weight={:.2}, adaptive={}",
+            base_promotion_threshold,
+            short_window_weight,
+            medium_window_weight,
+            enable_adaptive_threshold
+        );
+
         Policy {
             access_stats: Arc::new(RwLock::new(HashMap::new())),
             system_metrics: Arc::new(SystemMetrics::new()),
@@ -849,6 +936,10 @@ impl Policy {
     /// Calculate adaptive promotion threshold based on system conditions
     fn calculate_adaptive_threshold(&self) -> f64 {
         if !self.enable_adaptive_threshold {
+            trace!(
+                "Adaptive threshold disabled, using base threshold: {:.2}",
+                self.base_promotion_threshold
+            );
             return self.base_promotion_threshold;
         }
 
@@ -856,43 +947,64 @@ impl Policy {
         let hit_rate = self.system_metrics.get_hit_rate();
 
         let mut threshold = self.base_promotion_threshold;
+        let mut adjustments = Vec::new();
 
         // Adjust based on system load
         if system_load > self.aggressive_promotion_load_threshold {
             // High load: be more aggressive with promotion (lower threshold)
             threshold *= 0.7;
+            adjustments.push(format!("high load ({:.2}): *0.7", system_load));
         }
 
         // Adjust based on hit rate
         if hit_rate < self.conservative_promotion_hit_rate_threshold {
             // Low hit rate: be more conservative (higher threshold) to avoid cache pollution
             threshold *= 1.3;
+            adjustments.push(format!("low hit rate ({:.2}): *1.3", hit_rate));
         } else if hit_rate > 0.8 {
             // High hit rate: be more aggressive to maintain good performance
             threshold *= 0.9;
+            adjustments.push(format!("high hit rate ({:.2}): *0.9", hit_rate));
         }
 
         // Ensure threshold stays within reasonable bounds
-        threshold.clamp(1.0, 50.0)
+        let final_threshold = threshold.clamp(1.0, 50.0);
+
+        debug!(
+            "Adaptive threshold calculation: base={:.2}, system_load={:.2}, hit_rate={:.2}, adjustments=[{}], final={:.2}",
+            self.base_promotion_threshold,
+            system_load,
+            hit_rate,
+            adjustments.join(", "),
+            final_threshold
+        );
+
+        final_threshold
     }
 
     async fn record_access(&self, key: String) {
+        trace!("Recording access for key: {}", key);
+
         // Use read lock to get or create AccessStats
         {
             let stats = self.access_stats.read().await;
             if let Some(entry) = stats.get(&key) {
                 // If exists, directly record access (no need for write lock)
+                trace!("Found existing access stats for key: {}", key);
                 entry.record_access();
                 return;
             }
         }
 
         // If not exists, get write lock to create
+        trace!("Creating new access stats for key: {}", key);
         let mut stats = self.access_stats.write().await;
         // Double check, prevent other threads from creating in the meantime
         if let Some(entry) = stats.get(&key) {
+            trace!("Access stats created by another thread for key: {}", key);
             entry.record_access();
         } else {
+            debug!("Creating new AccessStats entry for key: {}", key);
             let entry = AccessStats::new(
                 self.short_window_size,
                 self.medium_window_size,
@@ -906,6 +1018,10 @@ impl Policy {
     async fn should_promote(&self, key: String) -> bool {
         // Calculate adaptive threshold
         let threshold = self.calculate_adaptive_threshold();
+        trace!(
+            "Calculated promotion threshold for key '{}': {:.2}",
+            key, threshold
+        );
 
         // Use read lock to check promotion conditions, reduce lock contention
         let stats = self.access_stats.read().await;
@@ -914,19 +1030,38 @@ impl Policy {
             let weighted_frequency = entry
                 .get_weighted_access_frequency(self.short_window_weight, self.medium_window_weight);
 
-            weighted_frequency >= threshold
+            let should_promote = weighted_frequency >= threshold;
+            debug!(
+                "Promotion decision for key '{}': frequency={:.2}, threshold={:.2}, should_promote={}",
+                key, weighted_frequency, threshold, should_promote
+            );
+
+            should_promote
         } else {
+            trace!("No access stats found for key '{}', not promoting", key);
             false
         }
     }
 
     /// Record cache request for metrics tracking
     fn record_cache_request(&self, hit: bool) {
+        trace!("Recording cache request: hit={}", hit);
         self.system_metrics.record_request(hit);
     }
 
     /// Update cache utilization metrics
     fn update_cache_utilization(&self, current_size: u64, max_size: u64) {
+        let utilization = if max_size > 0 {
+            current_size as f64 / max_size as f64
+        } else {
+            0.0
+        };
+        trace!(
+            "Updating cache utilization: {}/{} ({:.2}%)",
+            current_size,
+            max_size,
+            utilization * 100.0
+        );
         self.system_metrics
             .update_cache_utilization(current_size, max_size);
     }
@@ -1066,10 +1201,16 @@ impl ChunksCache {
 
     /// Creates a new ChunksCache with custom configuration
     pub async fn new_with_config(mut config: ChunksCacheConfig) -> anyhow::Result<Self> {
+        info!(
+            "Creating new ChunksCache with configuration: hot_cache_size={}, cold_cache_size={}, base_promotion_threshold={}",
+            config.hot_cache_size, config.cold_cache_size, config.base_promotion_threshold
+        );
+
         let cache_dir = config
             .disk_storage_dir
             .take()
             .unwrap_or_else(|| cache_dir().unwrap());
+        debug!("Using cache directory: {:?}", cache_dir);
         let disk_storage = DiskStorage::new(cache_dir).await?;
 
         let hot_cache_builder = moka::future::Cache::builder()
@@ -1081,6 +1222,10 @@ impl ChunksCache {
             .time_to_idle(Duration::from_secs(30))
             .time_to_live(Duration::from_secs(120));
 
+        debug!(
+            "Creating policy with adaptive threshold: {}",
+            config.enable_adaptive_threshold
+        );
         let policy = Policy::new(
             config.short_window_size,
             config.medium_window_size,
@@ -1093,6 +1238,7 @@ impl ChunksCache {
             config.conservative_promotion_hit_rate_threshold,
         );
 
+        info!("ChunksCache created successfully");
         Ok(Self {
             disk_storage,
             hot_cache: hot_cache_builder.build(),
@@ -1103,15 +1249,22 @@ impl ChunksCache {
     }
 
     pub async fn get(&self, key: &String) -> Option<Vec<u8>> {
+        trace!("Cache GET request for key: {}", key);
         self.policy.record_access(key.clone()).await;
 
         // Check hot cache first
         if let Some(value) = self.hot_cache.get(key).await {
+            debug!(
+                "Hot cache HIT for key: {}, size: {} bytes",
+                key,
+                value.len()
+            );
             self.policy.record_cache_request(true);
             self.update_utilization_metrics();
             return Some(value);
         }
 
+        debug!("Hot cache MISS for key: {}", key);
         self.policy.record_cache_request(false);
 
         let diskstorage = self.disk_storage.clone();
@@ -1123,9 +1276,25 @@ impl ChunksCache {
         self.cold_cache.get(key).await?;
 
         let load_future = async move {
+            trace!("Loading data from disk for key: {}", key_owned);
             let value = diskstorage.load(&key_owned).await.ok().unwrap_or_default();
+
+            if value.is_empty() {
+                warn!("No data found on disk for key: {}", key_owned);
+                return value;
+            }
+
+            debug!(
+                "Loaded {} bytes from disk for key: {}",
+                value.len(),
+                key_owned
+            );
+
             if policy.should_promote(key_owned.clone()).await {
+                debug!("Promoting key to hot cache: {}", key_owned);
                 hot_cache.insert(key_owned.clone(), value.clone()).await;
+            } else {
+                trace!("Key not eligible for promotion: {}", key_owned);
             }
 
             value
@@ -1135,30 +1304,55 @@ impl ChunksCache {
 
         self.update_utilization_metrics();
 
-        if value.is_empty() { None } else { value.into() }
+        if value.is_empty() {
+            debug!("No data found for key: {}", key);
+            None
+        } else {
+            debug!("Returning {} bytes for key: {}", value.len(), key);
+            value.into()
+        }
     }
 
     /// Update cache utilization metrics
     fn update_utilization_metrics(&self) {
         let current_size = self.hot_cache.entry_count();
         let max_size = self.config.hot_cache_size as u64;
+        trace!(
+            "Updating cache utilization: {}/{} entries",
+            current_size, max_size
+        );
         self.policy.update_cache_utilization(current_size, max_size);
     }
 
     pub async fn insert(&self, key: &str, data: &Vec<u8>) -> anyhow::Result<()> {
+        info!(
+            "Cache INSERT request for key: {}, size: {} bytes",
+            key,
+            data.len()
+        );
+        trace!("Inserting into hot cache: {}", key);
         self.hot_cache.insert(key.to_owned(), data.clone()).await;
+
+        trace!("Storing on disk: {}", key);
         self.disk_storage.store(key, data).await?;
+
+        trace!("Adding to cold cache: {}", key);
         self.cold_cache.insert(key.to_owned(), ()).await;
 
+        debug!("Successfully inserted key: {}", key);
         Ok(())
     }
 
     #[allow(dead_code)]
     pub async fn remove(&self, key: &String) -> anyhow::Result<()> {
+        info!("Cache REMOVE request for key: {}", key);
+        trace!("Invalidating from hot cache: {}", key);
         self.hot_cache.invalidate(key).await;
         // self.disk_storage.remove(key).await?;
+        trace!("Invalidating from cold cache: {}", key);
         self.cold_cache.invalidate(key).await;
 
+        debug!("Successfully removed key: {}", key);
         Ok(())
     }
 }

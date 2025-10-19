@@ -69,7 +69,8 @@ fn process_config_for_backend(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+    let format = tracing_subscriber::fmt::format().with_ansi(false);
+    tracing_subscriber::fmt().event_format(format).init();
 
     #[cfg(not(target_os = "linux"))]
     {
