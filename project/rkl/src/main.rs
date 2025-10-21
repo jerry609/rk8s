@@ -13,6 +13,8 @@ mod task;
 use commands::{compose::ComposeCommand, container::ContainerCommand, pod::PodCommand};
 use commands::{compose::compose_execute, container::container_execute, pod::pod_execute};
 
+use crate::commands::volume::{VolumeCommand, volume_execute};
+
 #[derive(Parser)]
 #[command(name = "rkl")]
 #[command(
@@ -31,6 +33,7 @@ impl Cli {
             Workload::Pod(cmd) => pod_execute(cmd),
             Workload::Container(cmd) => container_execute(cmd),
             Workload::Compose(cmd) => compose_execute(cmd),
+            Workload::Volume(cmd) => volume_execute(cmd),
         }
     }
 }
@@ -49,6 +52,9 @@ enum Workload {
         alias = "C"
     )]
     Compose(ComposeCommand),
+
+    #[command(subcommand, about = "Manage the volume type", alias = "v")]
+    Volume(VolumeCommand),
 }
 
 fn main() -> Result<(), anyhow::Error> {
