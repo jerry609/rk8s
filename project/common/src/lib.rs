@@ -5,9 +5,11 @@ use std::convert::{TryFrom, TryInto};
 use std::fmt::{Display, Formatter};
 use std::{
     collections::HashMap,
+    fmt,
     net::{Ipv4Addr, Ipv6Addr},
     time::Duration,
 };
+use uuid::Uuid;
 
 pub mod _private {
     pub use log::error;
@@ -27,16 +29,43 @@ pub struct TypeMeta {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ObjectMeta {
     pub name: String,
-    #[serde(default)]
-    pub uid: Option<String>,
     #[serde(default = "default_namespace")]
     pub namespace: String,
+    #[serde(default = "Uuid::new_v4")]
+    pub uid: Uuid,
     #[serde(default)]
     pub labels: HashMap<String, String>,
     #[serde(default)]
     pub annotations: HashMap<String, String>,
+    #[serde(default)]
+    pub owner_references: Option<Vec<OwnerReference>>,
+    #[serde(default)]
+    #[serde(with = "chrono::serde::ts_seconds_option")]
+    pub creation_timestamp: Option<DateTime<Utc>>,
+    #[serde(default)]
+    #[serde(with = "chrono::serde::ts_seconds_option")]
+    pub deletion_timestamp: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub finalizers: Option<Vec<Finalizer>>,
+}
+
+impl Default for ObjectMeta {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            namespace: default_namespace(),
+            uid: Uuid::new_v4(),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            owner_references: None,
+            creation_timestamp: Some(Utc::now()),
+            deletion_timestamp: None,
+            finalizers: None,
+        }
+    }
 }
 
 /// A lightweight reference to another object (similar to Kubernetes' ObjectReference).
@@ -61,6 +90,110 @@ pub struct ObjectReference {
 
 fn default_namespace() -> String {
     "default".to_string()
+}
+
+#[derive(Debug, Hash, PartialEq, Eq, Serialize, Deserialize, Copy, Clone, Default)]
+pub enum ResourceKind {
+    Pod,
+    Service,
+    Deployment,
+    ReplicaSet,
+    #[default]
+    Unknown,
+}
+
+impl fmt::Display for ResourceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            ResourceKind::Pod => "Pod",
+            ResourceKind::Service => "Service",
+            ResourceKind::Deployment => "Deployment",
+            ResourceKind::ReplicaSet => "ReplicaSet",
+            ResourceKind::Unknown => "Unknown",
+        };
+        write!(f, "{}", kind)
+    }
+}
+
+impl From<&str> for ResourceKind {
+    fn from(input: &str) -> Self {
+        match input {
+            "Pod" => ResourceKind::Pod,
+            "Service" => ResourceKind::Service,
+            "Deployment" => ResourceKind::Deployment,
+            "ReplicaSet" => ResourceKind::ReplicaSet,
+            _ => ResourceKind::Unknown, // Default to Unknown for unknown kinds
+        }
+    }
+}
+
+/// Owner reference that establishes ownership relationships between resources.
+///
+/// This is a core mechanism for managing resource dependencies. The `GarbageCollector`
+/// uses `OwnerReference` to implement cascading deletion: when an owner resource is deleted,
+/// the garbage collector automatically handles the deletion of dependent resources based on
+/// the deletion propagation policy. It tracks owner-dependant relationships through these
+/// references.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone, Default)]
+pub struct OwnerReference {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    pub kind: ResourceKind,
+    pub name: String,
+    pub uid: Uuid,
+    pub controller: bool,
+    #[serde(default)]
+    pub block_owner_deletion: Option<bool>,
+}
+
+/// Finalizer used to perform cleanup operations when a resource is deleted.
+///
+/// When a resource contains finalizers, it will not be immediately deleted even if a delete
+/// request is received. Instead, it waits until all finalizers are removed before actual deletion.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum Finalizer {
+    DeletingDependents,
+    OrphanDependents,
+    Custom(String),
+}
+
+impl From<&str> for Finalizer {
+    fn from(s: &str) -> Self {
+        match s {
+            "DeletingDependents" => Finalizer::DeletingDependents,
+            "OrphanDependents" => Finalizer::OrphanDependents,
+            other => Finalizer::Custom(other.to_string()),
+        }
+    }
+}
+
+impl fmt::Display for Finalizer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Finalizer::DeletingDependents => write!(f, "DeletingDependents"),
+            Finalizer::OrphanDependents => write!(f, "OrphanDependents"),
+            Finalizer::Custom(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+/// Delete propagation policy for cascading deletion.
+///
+/// When deleting an owner resource, you can specify how its dependents should be handled:
+///
+/// - **Foreground**: Mark the owner for deletion, but don't delete it until all its dependents
+///   are deleted. The owner gets a `DeletingDependents` finalizer and waits for all blocking
+///   dependents to be removed.
+/// - **Background**: Delete the owner immediately, and let the garbage collector delete its
+///   dependents in the background. This is the fastest deletion method.
+/// - **Orphan**: Delete the owner, but leave dependents as orphaned objects (remove owner
+///   references from dependents). The owner gets an `OrphanDependents` finalizer and
+///   will be deleted after all dependents' owner references are removed.
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub enum DeletePropagationPolicy {
+    Foreground,
+    Background,
+    Orphan,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
