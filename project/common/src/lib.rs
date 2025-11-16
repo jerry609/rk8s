@@ -98,6 +98,7 @@ pub enum ResourceKind {
     Service,
     Deployment,
     ReplicaSet,
+    Endpoint,
     #[default]
     Unknown,
 }
@@ -109,6 +110,7 @@ impl fmt::Display for ResourceKind {
             ResourceKind::Service => "Service",
             ResourceKind::Deployment => "Deployment",
             ResourceKind::ReplicaSet => "ReplicaSet",
+            ResourceKind::Endpoint => "Endpoint",
             ResourceKind::Unknown => "Unknown",
         };
         write!(f, "{}", kind)
@@ -122,6 +124,7 @@ impl From<&str> for ResourceKind {
             "Service" => ResourceKind::Service,
             "Deployment" => ResourceKind::Deployment,
             "ReplicaSet" => ResourceKind::ReplicaSet,
+            "Endpoint" => ResourceKind::Endpoint,
             _ => ResourceKind::Unknown, // Default to Unknown for unknown kinds
         }
     }
@@ -865,8 +868,12 @@ pub struct ExternalInterface {
 pub struct ServiceSpec {
     #[serde(rename = "type", default = "default_service_type")]
     pub service_type: String, // ClusterIP, NodePort, LoadBalancer
+    /// **BREAKING CHANGE**: The `selector` field type changed from `HashMap<String, String>` to `Option<LabelSelector>`.
+    /// This aligns with Kubernetes API semantics and allows for match expressions.
+    /// All code accessing `svc.spec.selector` must be updated to handle `Option<LabelSelector>`.
+    /// See release notes for migration details.
     #[serde(default)]
-    pub selector: HashMap<String, String>,
+    pub selector: Option<LabelSelector>,
     #[serde(default)]
     pub ports: Vec<ServicePort>,
     #[serde(rename = "clusterIP", default)]
