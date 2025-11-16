@@ -839,7 +839,6 @@ mod tests {
             metadata: ObjectMeta {
                 name: "demo".to_string(),
                 namespace: "default".to_string(),
-                labels,
                 annotations: HashMap::new(),
                 ..Default::default()
             },
