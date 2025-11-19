@@ -9,8 +9,10 @@ pub mod database_store;
 pub mod etcd_store;
 pub mod etcd_watch;
 pub mod pool;
+pub mod redis_store;
 
 // Re-export main types for convenience
 pub use database_store::DatabaseMetaStore;
 pub use etcd_store::EtcdMetaStore;
 pub use etcd_watch::{CacheInvalidationEvent, EtcdWatchWorker, WatchConfig};
+pub use redis_store::RedisMetaStore;
