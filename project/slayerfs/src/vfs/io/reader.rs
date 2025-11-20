@@ -1,8 +1,9 @@
-use crate::chuck::{BlockStore, ChunkSpan, split_file_range_into_chunks};
+use crate::chuck::{BlockStore, ChunkSpan, ChunkTag};
 use crate::meta::MetaStore;
 use crate::vfs::chunk_id_for;
 use crate::vfs::fs::ChunkIoFactory;
 use crate::vfs::inode::Inode;
+use std::convert::TryFrom;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -45,8 +46,16 @@ where
         // a stale slice set and end up reading the wrong data.
         let writer_guard = self.writer.read().await;
 
-        let spans: Vec<ChunkSpan> =
-            split_file_range_into_chunks(self.chunk_io.layout(), offset, len);
+        let layout = self.chunk_io.layout();
+        let chunk_span = ChunkSpan::new(
+            layout.chunk_index_of(offset),
+            u32::try_from(layout.within_chunk_offset(offset))
+                .expect("chunk offset must fit within u32 for spans"),
+            u32::try_from(len).expect("read length must fit within u32 for spans"),
+        );
+        let spans: Vec<ChunkSpan> = chunk_span
+            .split_into::<ChunkTag>(layout.chunk_size, layout.chunk_size, false)
+            .collect();
         let mut readers = Vec::new();
         for span in spans.iter() {
             let cid = chunk_id_for(self.inode.ino(), span.index);
@@ -63,7 +72,7 @@ where
 
         let mut out = Vec::new();
         for (span, mut reader) in spans.into_iter().zip(readers.into_iter()) {
-            let part = reader.read(span.offset as u32, span.len).await?;
+            let part = reader.read(span.offset, span.len as usize).await?;
             out.extend(part);
         }
         Ok(out)

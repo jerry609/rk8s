@@ -70,6 +70,7 @@ impl ChunkLayout {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn within_block_offset(&self, offset_in_chunk: u64) -> u32 {
         (offset_in_chunk % self.block_size as u64) as u32
     }

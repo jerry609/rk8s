@@ -1,8 +1,8 @@
 //! ChunkWriter: splits buffered data into block-aligned segments and writes them to the store.
 
+use super::chunk::ChunkLayout;
 use super::slice::{SliceDesc, SliceIO, Write};
 use super::store::BlockStore;
-use super::{chunk::ChunkLayout, slice::BlockSpan};
 use crate::meta::{MetaStore, SLICE_ID_KEY};
 use anyhow::Result;
 use std::sync::{Arc, Mutex};

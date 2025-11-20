@@ -18,6 +18,7 @@ pub mod cache;
 pub mod chunk;
 pub mod reader;
 pub mod slice;
+pub mod span;
 pub mod store;
 pub mod util;
 pub mod writer;
@@ -27,6 +28,7 @@ pub use chunk::{
 };
 pub use reader::ChunkReader;
 pub use slice::{BlockSpan, SliceDesc};
+pub use span::{BlockTag, ChunkTag, PageTag, Span, SpanTag};
 pub use store::{BlockStore, InMemoryBlockStore, ObjectBlockStore, RustfsBlockStore, S3BlockStore};
-pub use util::{ChunkSpan, split_file_range_into_chunks};
+pub use util::ChunkSpan;
 pub use writer::ChunkWriter;

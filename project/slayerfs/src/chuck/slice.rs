@@ -22,21 +22,17 @@
 //!
 //! Note: this module assumes the provided slice stays inside a single chunk; cross-chunk validation is not performed.
 
-use super::chunk::ChunkLayout;
+use super::{
+    chunk::ChunkLayout,
+    span::{BlockTag, ChunkTag, Span},
+};
 use crate::chuck::BlockStore;
 use crate::meta::MetaStore;
 use anyhow::Context;
 use std::marker::PhantomData;
 
 /// Portion of a slice that resides inside a single block.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockSpan {
-    pub index: u32,
-    /// Start offset within the block (bytes).
-    pub offset: u32,
-    /// Length covered inside the block (bytes).
-    pub len: u32,
-}
+pub type BlockSpan = Span<BlockTag>;
 
 /// Basic slice descriptor for a chunk-local contiguous range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -49,40 +45,9 @@ pub struct SliceDesc {
     pub length: u32,
 }
 
-impl SliceDesc {
-    /// Map this slice into a list of block spans.
-    ///
-    /// - Returns an empty list when `length == 0`.
-    /// - Each returned span stays within block bounds (`offset + len <= block_size`).
-    /// - The spans cover the entire `[offset, offset+length)` range.
-    pub fn block_spans(&self, layout: ChunkLayout) -> Vec<BlockSpan> {
-        if self.length == 0 {
-            return Vec::new();
-        }
-
-        let mut spans = Vec::new();
-        let mut remaining = self.length as u64;
-        let mut cur_off_in_chunk = self.offset as u64;
-
-        while remaining > 0 {
-            // Determine the block index and within-block offset for the current position
-            let bi = layout.block_index_of(cur_off_in_chunk);
-            let wbo = layout.within_block_offset(cur_off_in_chunk) as u64;
-            // Remaining capacity in this block
-            let cap = layout.block_size as u64 - wbo;
-            // Take the min of remaining capacity and remaining length
-            let take = cap.min(remaining);
-            spans.push(BlockSpan {
-                index: bi,
-                offset: wbo as u32,
-                len: take as u32,
-            });
-            // Advance to the next starting point
-            cur_off_in_chunk += take;
-            remaining -= take;
-        }
-        spans
-    }
+fn block_span_iter(desc: SliceDesc, layout: ChunkLayout) -> impl Iterator<Item = BlockSpan> {
+    let chunk_span = Span::<ChunkTag>::new(0, desc.offset, desc.length);
+    chunk_span.split_into::<BlockTag>(layout.chunk_size, layout.block_size as u64, true)
 }
 
 pub struct Write;
@@ -115,10 +80,9 @@ where
     B: BlockStore,
 {
     pub async fn write(&self, buf: &[u8]) -> anyhow::Result<SliceDesc> {
-        let spans = self.desc.block_spans(self.layout);
         let mut cursor = 0;
 
-        for (index, span) in spans.iter().enumerate() {
+        for (index, span) in block_span_iter(self.desc, self.layout).enumerate() {
             let take = span.len as usize;
             let data = &buf[cursor..(cursor + take)];
 
@@ -137,10 +101,9 @@ where
 {
     pub async fn read(&self, buf: &mut [u8]) -> anyhow::Result<()> {
         debug_assert_eq!(buf.len(), self.desc.length as usize);
-        let spans = self.desc.block_spans(self.layout);
         let mut cursor = 0usize;
 
-        for (index, span) in spans.iter().enumerate() {
+        for (index, span) in block_span_iter(self.desc, self.layout).enumerate() {
             let take = span.len as usize;
             let out = &mut buf[cursor..cursor + take];
             self.store
@@ -175,7 +138,7 @@ mod tests {
             offset: 0,
             length: DEFAULT_BLOCK_SIZE / 2,
         };
-        let spans = s.block_spans(layout);
+        let spans: Vec<BlockSpan> = block_span_iter(s, layout).collect();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].index, 0);
         assert_eq!(spans[0].offset, 0);
@@ -192,7 +155,7 @@ mod tests {
             offset: half,
             length: layout.block_size,
         };
-        let spans = s.block_spans(layout);
+        let spans: Vec<BlockSpan> = block_span_iter(s, layout).collect();
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].index, 0);
         assert_eq!(spans[0].offset, (layout.block_size / 2));
