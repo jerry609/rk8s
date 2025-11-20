@@ -220,6 +220,10 @@ scopeguard = "1.2.0"
 serial_test = "3.2.0"
 prost-build = "0.11.9"
 hostname = "0.3"
+criterion = { version = "0.5", features = ["html_reports"] }
+pprof = { version = "0.15", features = ["criterion", "flamegraph"] }
+if-addrs = "0.6.0"
+redis = { version = "0.26", features = ["tokio-comp", "connection-manager"] }
 
 [profile.release]
 debug = true
