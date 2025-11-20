@@ -10,7 +10,7 @@ use crate::meta::entities::etcd::*;
 use crate::meta::entities::*;
 use crate::meta::store::{DirEntry, FileAttr, MetaError, MetaStore};
 use crate::meta::stores::pool::IdPool;
-use crate::meta::{INODE_ID_KEY, Permission};
+use crate::meta::{INODE_ID_KEY, Permission, SESSION_ID_KEY};
 use crate::vfs::fs::FileType;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -800,6 +800,86 @@ impl EtcdMetaStore {
         .await
         .map(|_| ())
         .map_err(|e| MetaError::Internal(format!("Update parent children failed: {e}")))
+    }
+
+    /// Helper method to clean session data
+    async fn clean_session_data(
+        &self,
+        session_key: &str,
+        session_id: u64,
+    ) -> Result<(), MetaError> {
+        // Get session data for logging
+        if let Some(session_data) = self.etcd_get_json::<serde_json::Value>(session_key).await? {
+            info!("Cleaning etcd session: {} -> {}", session_key, session_id);
+
+            // TODO: Implement comprehensive cleanup similar to JuiceFS:
+            // - Release any locks held by this session
+            // - Clean up sustained inodes
+            // - Remove temporary resources
+
+            // Mark session as stale instead of immediate deletion
+            // This allows for recovery and audit trails
+            let mut updated_data = session_data.clone();
+            updated_data["stale"] = serde_json::Value::Bool(true);
+            updated_data["updated_at"] =
+                serde_json::Value::Number(serde_json::Number::from(Utc::now().timestamp_millis()));
+
+            self.etcd_put_json(session_key, &updated_data).await?;
+
+            // Optional: Remove session_id mapping after marking stale
+            let mut client = self.client.clone();
+            if let Err(e) = client
+                .delete(format!("session_id:{}", session_id), None)
+                .await
+            {
+                warn!(
+                    "Failed to remove session_id mapping for {}: {}",
+                    session_id, e
+                );
+            }
+
+            info!("Successfully marked etcd session {} as stale", session_id);
+            Ok(())
+        } else {
+            Err(MetaError::NotFound(session_id as i64))
+        }
+    }
+
+    /// Helper method to find session key by scanning when session_id mapping is not available
+    async fn find_session_key_by_scan(&self, session_id: u64) -> Result<String, MetaError> {
+        let mut client = self.client.clone();
+
+        // Get all session keys
+        let resp = client
+            .get(
+                "session:".to_string(),
+                Some(etcd_client::GetOptions::new().with_prefix()),
+            )
+            .await
+            .map_err(|e| MetaError::Internal(format!("Failed to scan sessions: {}", e)))?;
+
+        for kv in resp.kvs() {
+            let key_str = String::from_utf8_lossy(kv.key());
+
+            // Skip session_id mapping keys
+            if key_str.starts_with("session_id:") {
+                continue;
+            }
+
+            if let Ok(session_data) = serde_json::from_slice::<serde_json::Value>(kv.value())
+                && let Some(stored_id) = session_data.get("id").and_then(|v| v.as_u64())
+                && stored_id == session_id
+            {
+                // Found the session, return the key
+                info!(
+                    "Found etcd session key by scan: {} -> {}",
+                    key_str, session_id
+                );
+                return Ok(key_str.to_string());
+            }
+        }
+
+        Err(MetaError::NotFound(session_id as i64))
     }
 }
 
@@ -1750,6 +1830,231 @@ impl MetaStore for EtcdMetaStore {
     async fn next_id(&self, key: &str) -> Result<i64, MetaError> {
         self.generate_id(key).await
     }
+
+    // ---------- Session lifecycle implementation ----------
+
+    async fn new_session(&self, payload: &[u8], update: bool) -> Result<(), MetaError> {
+        // Parse the payload to extract client information
+        let session_info = match serde_json::from_slice::<serde_json::Value>(payload) {
+            Ok(info) => info,
+            Err(_) => {
+                // If parsing fails, create a minimal session info
+                serde_json::json!({
+                    "version": "unknown",
+                    "process_id": std::process::id(),
+                })
+            }
+        };
+
+        let hostname = session_info
+            .get("host_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        let process_id = session_info
+            .get("process_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        let session_key = format!("session:{}:{}", hostname, process_id);
+
+        if update {
+            // Try to get existing session
+            if let Some(mut session_data) = self
+                .etcd_get_json::<serde_json::Value>(&session_key)
+                .await?
+            {
+                // Update existing session
+                session_data["payload"] = serde_json::to_value(payload).unwrap_or_default();
+                session_data["updated_at"] = serde_json::Value::Number(serde_json::Number::from(
+                    Utc::now().timestamp_millis(),
+                ));
+                session_data["stale"] = serde_json::Value::Bool(false);
+
+                self.etcd_put_json(&session_key, &session_data).await?;
+                info!("Updated existing etcd session: {}", session_key);
+                return Ok(());
+            }
+        }
+
+        // Create new session
+        let session_id = self.next_id(SESSION_ID_KEY).await? as u64;
+
+        let session_data = serde_json::json!({
+            "id": session_id,
+            "payload": serde_json::to_value(payload).unwrap_or_default(),
+            "created_at": Utc::now().timestamp_millis(),
+            "updated_at": Utc::now().timestamp_millis(),
+            "stale": false,
+            "hostname": hostname,
+            "process_id": process_id,
+        });
+
+        // Store both by session_id and by hostname:pid for lookup
+        self.etcd_put_json(&session_key, &session_data).await?;
+        self.etcd_put_json(&format!("session_id:{}", session_id), &session_key)
+            .await?;
+
+        info!(
+            "Created new etcd session: {} -> {}",
+            session_key, session_id
+        );
+        Ok(())
+    }
+
+    async fn refresh_session(&self) -> Result<(), MetaError> {
+        // Default implementation: try to refresh current process session
+        let session_id = crate::meta::client::session::SessionId::current();
+        self.refresh_session_by_id(&session_id).await
+    }
+
+    async fn refresh_session_by_id(
+        &self,
+        session_id: &crate::meta::client::session::SessionId,
+    ) -> Result<(), MetaError> {
+        // For etcd, we refresh the specific session identified by hostname:process_id
+        let session_key = session_id.to_key();
+
+        // Try to get and update the existing session
+        if let Some(mut session_data) = self
+            .etcd_get_json::<serde_json::Value>(&session_key)
+            .await?
+        {
+            // Update the session timestamp and mark as not stale
+            session_data["updated_at"] =
+                serde_json::Value::Number(serde_json::Number::from(Utc::now().timestamp_millis()));
+            session_data["stale"] = serde_json::Value::Bool(false);
+
+            self.etcd_put_json(&session_key, &session_data).await?;
+
+            if let Some(session_id_num) = session_data.get("id").and_then(|v| v.as_u64()) {
+                info!(
+                    "Refreshed etcd session: {} -> {}",
+                    session_key, session_id_num
+                );
+            } else {
+                info!("Refreshed etcd session: {}", session_key);
+            }
+        } else {
+            // Session not found, client needs to create one first
+            return Err(MetaError::NotFound(0));
+        }
+
+        Ok(())
+    }
+
+    async fn find_stale_sessions(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<crate::meta::store::SessionInfo>, MetaError> {
+        use crate::meta::store::SessionInfo;
+
+        // Consider sessions stale if not updated for more than 5 minutes (300,000 ms)
+        let stale_threshold = Utc::now().timestamp_millis() - 300_000;
+
+        let mut client = self.client.clone();
+
+        // Get all session keys (prefix: "session:")
+        let resp = client
+            .get(
+                "session:".to_string(),
+                Some(etcd_client::GetOptions::new().with_prefix()),
+            )
+            .await
+            .map_err(|e| MetaError::Internal(format!("Failed to scan sessions: {}", e)))?;
+
+        let mut stale_sessions = Vec::new();
+
+        for kv in resp.kvs() {
+            let key_str = String::from_utf8_lossy(kv.key());
+
+            // Skip session_id mapping keys, only process actual session data
+            if key_str.starts_with("session_id:") {
+                continue;
+            }
+
+            if let Ok(session_data) = serde_json::from_slice::<serde_json::Value>(kv.value()) {
+                // Check if session is not stale yet
+                if let Some(stale) = session_data.get("stale").and_then(|v| v.as_bool())
+                    && stale
+                {
+                    continue; // Already stale, skip
+                }
+
+                // Get updated_at timestamp
+                if let Some(updated_at) = session_data.get("updated_at").and_then(|v| v.as_i64())
+                    && updated_at < stale_threshold
+                {
+                    // Session is stale
+                    let session_id = session_data.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                    // Convert session data to info bytes
+                    let info = serde_json::to_vec(&session_data).unwrap_or_default();
+
+                    // Convert timestamp to SystemTime
+                    let updated_system_time = std::time::SystemTime::UNIX_EPOCH
+                        .checked_add(std::time::Duration::from_millis(updated_at as u64))
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+                    stale_sessions.push(SessionInfo {
+                        id: session_id,
+                        info,
+                        updated_at: updated_system_time,
+                    });
+                }
+            }
+        }
+
+        // Apply limit if specified
+        if let Some(limit) = limit {
+            stale_sessions.truncate(limit);
+        }
+
+        info!("Found {} stale etcd sessions", stale_sessions.len());
+        Ok(stale_sessions)
+    }
+
+    async fn clean_stale_session(&self, session_id: u64) -> Result<(), MetaError> {
+        // Find the session key by ID
+        let session_key = if let Some(session_key) = self
+            .etcd_get_json::<String>(&format!("session_id:{}", session_id))
+            .await?
+        {
+            session_key
+        } else {
+            // Try to find session by scanning if session_id mapping is not available
+            let session_key = self.find_session_key_by_scan(session_id).await?;
+            return self.clean_session_data(&session_key, session_id).await;
+        };
+
+        // Clean session data
+        self.clean_session_data(&session_key, session_id).await
+    }
+
+    async fn clean_session_by_id(
+        &self,
+        session_id: &crate::meta::client::session::SessionId,
+    ) -> Result<(), MetaError> {
+        let session_key = session_id.to_key();
+
+        // Get session ID from the session data first
+        if let Some(session_data) = self
+            .etcd_get_json::<serde_json::Value>(&session_key)
+            .await?
+        {
+            // Extract the "id" field from the JSON object
+            if let Some(id) = session_data.get("id").and_then(|v| v.as_u64()) {
+                self.clean_session_data(&session_key, id).await
+            } else {
+                // "id" field missing or not a u64; treat as not found or return error
+                Err(MetaError::SessionNotFound)
+            }
+        } else {
+            // Session not found, nothing to clean
+            Ok(())
+        }
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

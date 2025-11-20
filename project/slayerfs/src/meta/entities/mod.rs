@@ -3,6 +3,7 @@ pub mod access_meta;
 pub mod content_meta;
 pub mod etcd;
 pub mod file_meta;
+pub mod session_meta;
 pub mod slice_meta;
 
 pub use access_meta::{Entity as AccessMeta, Model as AccessMetaModel};
