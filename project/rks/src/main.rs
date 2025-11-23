@@ -13,7 +13,7 @@ mod vault;
 use crate::controllers::endpoint_controller::EndpointController;
 use crate::controllers::garbage_collector::GarbageCollector;
 use crate::controllers::{CONTROLLER_MANAGER, ControllerManager, ReplicaSetController};
-use crate::dns::authority::{run_dns_server, setup_iptable};
+use crate::dns::authority::{run_dns_server, setup_dns_nftable};
 use crate::network::init;
 use crate::network::manager::LocalManager;
 use crate::node::{NodeRegistry, RksNode, Shared};
@@ -129,7 +129,7 @@ async fn setup_dns_firewall(cfg: &Config) -> anyhow::Result<()> {
         .next()
         .unwrap_or("127.0.0.1")
         .to_string();
-    setup_iptable(server_ip, cfg.dns_config.port).await
+    setup_dns_nftable(server_ip, cfg.dns_config.port).await
 }
 
 async fn init_local_manager(

@@ -25,5 +25,5 @@ rust_library(
     edition = "2021",
     rustc_flags = ["@$(location :liboci-cli-manifest[env_flags])"],
     visibility = ["PUBLIC"],
-    deps = ["//third-party/rust/crates/clap/4.5.48:clap"],
+    deps = ["//third-party/rust/crates/clap/4.5.51:clap"],
 )

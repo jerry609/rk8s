@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use anyhow::Result;
 use common::{Endpoint, PodTask, ServiceTask};
 use etcd_client::EventType;
 use futures::StreamExt;
@@ -16,6 +17,17 @@ use hickory_server::authority::{
 use hickory_server::server::RequestInfo;
 use hickory_server::store::forwarder::ForwardAuthority;
 use log::{debug, error, info};
+use nftables::expr::Meta as ExprMeta;
+use nftables::expr::MetaKey;
+use nftables::expr::{Expression, NamedExpression, Payload, PayloadField};
+use nftables::helper as nft_helper;
+use nftables::schema::Chain;
+use nftables::schema::Table;
+use nftables::schema::{NfCmd, NfListObject, NfObject, Nftables, Rule};
+use nftables::stmt::NATFamily;
+use nftables::stmt::{Match as StmtMatch, NAT, Operator, Statement};
+use nftables::types::NfFamily;
+use std::borrow::Cow;
 use std::env;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
@@ -690,71 +702,332 @@ fn parse_srv_query(
     Some((port_name, proto, svc, ns))
 }
 
-pub async fn setup_iptable(dns_ip: String, dns_port: u16) -> anyhow::Result<()> {
-    let br_name = env::var("BR_NAME").unwrap_or_else(|_| "cni0".to_string());
-    let ipt = iptables::new(false).map_err(|e| anyhow::anyhow!("failed to init iptables: {e}"))?;
+/// Ensure `nat` table in the ip family and `PREROUTING` chain exist
+pub async fn ensure_nat_prerouting_chain() -> Result<()> {
+    let current = tokio::task::spawn_blocking(nft_helper::get_current_ruleset)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))??;
 
-    let rule1 = format!("-i {br_name} -p udp --dport 53 -j REDIRECT --to-ports {dns_port}");
-    let rule2 = format!("-i {br_name} -p tcp --dport 53 -j REDIRECT --to-ports {dns_port}");
-    let rule3 =
-        format!("-p udp -d {dns_ip} --dport 53 -j DNAT --to-destination {dns_ip}:{dns_port}");
-    let rule4 =
-        format!("-p tcp -d {dns_ip} --dport 53 -j DNAT --to-destination {dns_ip}:{dns_port}");
+    let table_exists = current.objects.iter().any(|obj| match obj {
+        NfObject::ListObject(NfListObject::Table(t)) => t.family == NfFamily::IP && t.name == "nat",
+        _ => false,
+    });
 
-    let rules = [
-        ("rule1", &rule1),
-        ("rule2", &rule2),
-        ("rule3", &rule3),
-        ("rule4", &rule4),
-    ];
-
-    for (name, rule) in rules {
-        if !ipt
-            .exists("nat", "PREROUTING", rule)
-            .map_err(|e| anyhow::anyhow!("failed to check {name}: {e}"))?
-        {
-            ipt.append("nat", "PREROUTING", rule)
-                .map_err(|e| anyhow::anyhow!("failed to insert {name}: {e}"))?;
-            info!("Added iptables rule: {rule}");
-        } else {
-            info!("Rule already exists: {rule}");
+    let chain_exists = current.objects.iter().any(|obj| match obj {
+        NfObject::ListObject(NfListObject::Chain(c)) => {
+            c.table == "nat" && c.family == NfFamily::IP && c.name == "PREROUTING"
         }
+        _ => false,
+    });
+
+    let mut objects: Vec<NfObject> = Vec::new();
+
+    if !table_exists {
+        let table = Table {
+            family: NfFamily::IP,
+            name: Cow::Owned("nat".to_string()),
+            handle: None,
+        };
+        objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Table(table))));
     }
+
+    if !chain_exists {
+        let chain = Chain {
+            family: NfFamily::IP,
+            table: Cow::Owned("nat".to_string()),
+            name: Cow::Owned("PREROUTING".to_string()),
+            hook: Some(nftables::types::NfHook::Prerouting),
+            ..Default::default()
+        };
+        objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(chain))));
+    }
+
+    if objects.is_empty() {
+        return Ok(());
+    }
+
+    let to_apply = nftables::schema::Nftables {
+        objects: Cow::Owned(objects),
+    };
+
+    tokio::task::spawn_blocking(move || nft_helper::apply_ruleset(&to_apply))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))??;
 
     Ok(())
 }
 
-#[allow(dead_code)]
-pub async fn cleanup_iptable(dns_ip: String, dns_port: u16) -> anyhow::Result<()> {
+pub async fn setup_dns_nftable(dns_ip: String, dns_port: u16) -> anyhow::Result<()> {
+    ensure_nat_prerouting_chain().await?;
     let br_name = env::var("BR_NAME").unwrap_or_else(|_| "cni0".to_string());
-    let ipt = iptables::new(false).map_err(|e| anyhow::anyhow!("failed to init iptables: {e}"))?;
+    // Construct nftables Rule objects (no raw CLI strings). We create four
+    // rules and add them via the nftables JSON API helper.
+    let br = br_name.clone();
+    let ip = dns_ip.clone();
+    let port = dns_port;
 
-    let rule1 = format!("-i {br_name} -p udp --dport 53 -j REDIRECT --to-ports {dns_port}");
-    let rule2 = format!("-i {br_name} -p tcp --dport 53 -j REDIRECT --to-ports {dns_port}");
-    let rule3 =
-        format!("-p udp -d {dns_ip} --dport 53 -j DNAT --to-destination {dns_ip}:{dns_port}");
-    let rule4 =
-        format!("-p tcp -d {dns_ip} --dport 53 -j DNAT --to-destination {dns_ip}:{dns_port}");
+    // Helper to build an iifname match: `meta iifname "br"`
+    let iif_match = |ifname: String| {
+        Statement::Match(StmtMatch {
+            left: Expression::Named(NamedExpression::Meta(ExprMeta {
+                key: MetaKey::Iifname,
+            })),
+            op: Operator::EQ,
+            right: Expression::String(Cow::Owned(ifname)),
+        })
+    };
 
-    let rules = [
-        ("rule1", &rule1),
-        ("rule2", &rule2),
-        ("rule3", &rule3),
-        ("rule4", &rule4),
-    ];
-    for (name, rule) in rules {
-        if ipt
-            .exists("nat", "PREROUTING", rule)
-            .map_err(|e| anyhow::anyhow!("failed to check {name}: {e}"))?
-        {
-            ipt.delete("nat", "PREROUTING", rule)
-                .map_err(|e| anyhow::anyhow!("failed to delete {name}: {e}"))?;
-            info!("Deleted iptables rule: {rule}");
-        } else {
-            info!("Rule does not exist, skipping delete: {rule}");
+    // Helper to build `meta l4proto <proto>` match (proto as string "udp"/"tcp")
+    let proto_match = |proto: &str| {
+        let num = match proto {
+            "udp" => 17u32,
+            "tcp" => 6u32,
+            _ => 0u32,
+        };
+        Statement::Match(StmtMatch {
+            left: Expression::Named(NamedExpression::Meta(ExprMeta {
+                key: MetaKey::L4proto,
+            })),
+            op: Operator::EQ,
+            right: Expression::Number(num),
+        })
+    };
+
+    // Helper to match transport destination port: payload field e.g. `udp dport`
+    let dport_match = |proto: &str, dport: u32| {
+        Statement::Match(StmtMatch {
+            left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+                PayloadField {
+                    protocol: Cow::Owned(proto.to_string()),
+                    field: Cow::Owned("dport".to_string()),
+                },
+            ))),
+            op: Operator::EQ,
+            right: Expression::Number(dport),
+        })
+    };
+
+    // Build redirect rules for packets arriving on the bridge interface
+    // (iifname) for UDP and TCP port 53 -> redirect to local :port
+    let mut objects: Vec<NfObject> = Vec::new();
+
+    // Ensure a clean base: delete any existing rules with our comment, then re-add
+    let current = tokio::task::spawn_blocking(nft_helper::get_current_ruleset)
+        .await
+        .map_err(|e| anyhow::anyhow!(format!("failed to run nft helper task: {e}")))?;
+
+    if let Ok(ruleset) = current {
+        let mut delete_objects: Vec<NfObject> = Vec::new();
+        for obj in ruleset.objects.iter() {
+            if let NfObject::ListObject(listobj) = obj
+                && let NfListObject::Rule(r) = listobj
+                && let Some(comment) = &r.comment
+                && comment == "rk8s-dns-redirect"
+            {
+                let del_rule = Rule {
+                    family: r.family,
+                    table: r.table.clone(),
+                    chain: r.chain.clone(),
+                    handle: r.handle,
+                    expr: r.expr.clone(),
+                    ..Default::default()
+                };
+                delete_objects.push(NfObject::CmdObject(NfCmd::Delete(NfListObject::Rule(
+                    del_rule,
+                ))));
+            }
+        }
+
+        if !delete_objects.is_empty() {
+            let to_delete = Nftables {
+                objects: std::borrow::Cow::Owned(delete_objects),
+            };
+
+            tokio::task::spawn_blocking(move || nft_helper::apply_ruleset(&to_delete))
+                .await
+                .map_err(|e| anyhow::anyhow!(format!("failed to run nft helper task: {e}")))?
+                .map_err(|e| {
+                    anyhow::anyhow!(format!("failed to delete existing nftables rules: {e}"))
+                })?;
         }
     }
-    Ok(())
+
+    // Recreate the 4 rules unconditionally (redirect UDP/TCP and DNAT UDP/TCP)
+
+    // Redirect UDP
+    let rule_udp_redirect = Rule {
+        family: NfFamily::IP,
+        table: Cow::Owned("nat".to_string()),
+        chain: Cow::Owned("PREROUTING".to_string()),
+        comment: Some(Cow::Owned("rk8s-dns-redirect".to_string())),
+        expr: Cow::Owned(vec![
+            iif_match(br.clone()),
+            proto_match("udp"),
+            dport_match("udp", 53),
+            Statement::Redirect(Some(NAT {
+                addr: None,
+                family: None,
+                port: Some(Expression::Number(port as u32)),
+                flags: None,
+            })),
+        ]),
+        ..Default::default()
+    };
+    objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
+        rule_udp_redirect,
+    ))));
+
+    // Redirect TCP
+    let rule_tcp_redirect = Rule {
+        family: NfFamily::IP,
+        table: Cow::Owned("nat".to_string()),
+        chain: Cow::Owned("PREROUTING".to_string()),
+        comment: Some(Cow::Owned("rk8s-dns-redirect".to_string())),
+        expr: Cow::Owned(vec![
+            iif_match(br.clone()),
+            proto_match("tcp"),
+            dport_match("tcp", 53),
+            Statement::Redirect(Some(NAT {
+                addr: None,
+                family: None,
+                port: Some(Expression::Number(port as u32)),
+                flags: None,
+            })),
+        ]),
+        ..Default::default()
+    };
+    objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
+        rule_tcp_redirect,
+    ))));
+
+    // DNAT rules (UDP/TCP)
+    let ip_match = Statement::Match(StmtMatch {
+        left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+            PayloadField {
+                protocol: Cow::Owned("ip".to_string()),
+                field: Cow::Owned("daddr".to_string()),
+            },
+        ))),
+        op: Operator::EQ,
+        right: Expression::String(Cow::Owned(ip.clone())),
+    });
+
+    let rule_udp_dnat = Rule {
+        family: NfFamily::IP,
+        table: Cow::Owned("nat".to_string()),
+        chain: Cow::Owned("PREROUTING".to_string()),
+        comment: Some(Cow::Owned("rk8s-dns-redirect".to_string())),
+        expr: Cow::Owned(vec![
+            ip_match.clone(),
+            dport_match("udp", 53),
+            Statement::DNAT(Some(NAT {
+                addr: Some(Expression::String(Cow::Owned(ip.clone()))),
+                family: Some(NATFamily::IP),
+                port: Some(Expression::Number(port as u32)),
+                flags: None,
+            })),
+        ]),
+        ..Default::default()
+    };
+    objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
+        rule_udp_dnat,
+    ))));
+
+    let rule_tcp_dnat = Rule {
+        family: NfFamily::IP,
+        table: Cow::Owned("nat".to_string()),
+        chain: Cow::Owned("PREROUTING".to_string()),
+        comment: Some(Cow::Owned("rk8s-dns-redirect".to_string())),
+        expr: Cow::Owned(vec![
+            ip_match,
+            dport_match("tcp", 53),
+            Statement::DNAT(Some(NAT {
+                addr: Some(Expression::String(Cow::Owned(ip.clone()))),
+                family: Some(NATFamily::IP),
+                port: Some(Expression::Number(port as u32)),
+                flags: None,
+            })),
+        ]),
+        ..Default::default()
+    };
+    objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
+        rule_tcp_dnat,
+    ))));
+
+    let to_apply = Nftables {
+        objects: std::borrow::Cow::Owned(objects),
+    };
+
+    // Apply via helper in blocking task
+    let res = tokio::task::spawn_blocking(move || nft_helper::apply_ruleset(&to_apply))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))?;
+
+    match res {
+        Ok(()) => {
+            info!("Applied nftables rules for DNS redirect/DNAT");
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("failed to apply nftables rules: {e}")),
+    }
+}
+
+#[allow(dead_code)]
+pub async fn cleanup_dns_nftable() -> anyhow::Result<()> {
+    // Identify rules previously added by `setup_dns_nftable` by their comment
+    // `rk8s-dns-redirect`, obtain handles, and delete them using the nft JSON API.
+    let current = tokio::task::spawn_blocking(nft_helper::get_current_ruleset)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))?;
+
+    let nft = match current {
+        Ok(n) => n,
+        Err(e) => return Err(anyhow::anyhow!("failed to get current nft ruleset: {e}")),
+    };
+
+    // Collect delete commands for rules with our comment
+    let mut delete_objects: Vec<NfObject> = Vec::new();
+
+    for obj in nft.objects.iter() {
+        if let nftables::schema::NfObject::ListObject(listobj) = obj
+            && let nftables::schema::NfListObject::Rule(r) = listobj
+            && let Some(comment) = &r.comment
+            && comment == "rk8s-dns-redirect"
+        {
+            // Build a minimal rule identifier with handle to delete
+            let del_rule = Rule {
+                family: r.family,
+                table: r.table.clone(),
+                chain: r.chain.clone(),
+                handle: r.handle,
+                ..Default::default()
+            };
+            delete_objects.push(NfObject::CmdObject(NfCmd::Delete(
+                nftables::schema::NfListObject::Rule(del_rule),
+            )));
+        }
+    }
+
+    if delete_objects.is_empty() {
+        info!("No nftables rules with comment rk8s-dns-redirect found, nothing to delete");
+        return Ok(());
+    }
+
+    let to_apply = Nftables {
+        objects: std::borrow::Cow::Owned(delete_objects),
+    };
+
+    let res = tokio::task::spawn_blocking(move || nft_helper::apply_ruleset(&to_apply))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))?;
+
+    match res {
+        Ok(_) => {
+            info!("Deleted nftables rules with comment rk8s-dns-redirect");
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("failed to delete nftables rules: {e}")),
+    }
 }
 
 #[cfg(test)]

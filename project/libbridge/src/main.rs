@@ -27,10 +27,18 @@ use netlink_packet_route::{
     AddressFamily,
     link::{InfoBridge, InfoData, LinkAttribute, LinkInfo},
 };
+use nftables::expr::Meta as ExprMeta;
+use nftables::expr::MetaKey;
+use nftables::expr::{Expression, NamedExpression};
+use nftables::helper as nft_helper;
+use nftables::schema::{Chain, NfCmd, NfListObject, NfObject, Nftables, Rule, Table};
+use nftables::stmt::{Match as StmtMatch, Operator, Statement};
+use nftables::types::NfFamily;
 use rtnetlink::{
     LinkBridge,
     packet_core::{NLM_F_ACK, NLM_F_REQUEST},
 };
+use std::borrow::Cow;
 
 mod error;
 mod types;
@@ -510,7 +518,7 @@ async fn cmd_add(mut config: BridgeNetConf, inputs: Inputs) -> Result<SuccessRep
             }
         }
     }
-    setup_iptable(config.br_name.unwrap_or(BRIDGE_DEFAULT_NAME.to_owned())).await?;
+    setup_bridge_nftable(config.br_name.unwrap_or(BRIDGE_DEFAULT_NAME.to_owned())).await?;
 
     Ok(bridge_result)
 }
@@ -687,12 +695,14 @@ async fn cmd_del(config: BridgeNetConf, inputs: Inputs) -> Result<SuccessReply, 
     .await?;
 
     ipam_del().await?;
-    cleanup_iptable(config.br_name.unwrap_or(BRIDGE_DEFAULT_NAME.to_owned())).await?;
+    cleanup_bridge_nftable().await?;
     Ok(result)
 }
 
-pub async fn setup_iptable(br_name: String) -> anyhow::Result<()> {
-    let ipt = iptables::new(false).unwrap();
+pub async fn setup_bridge_nftable(br_name: String) -> anyhow::Result<()> {
+    // Use nftables AST to create rules (idempotent): ensure `filter` table and
+    // `FORWARD` chain exist, then add two ACCEPT rules between external iface
+    // and the bridge. Rules are tagged with a comment for cleanup.
 
     let ext_iface = lookup_ext_iface(
         None,
@@ -706,41 +716,194 @@ pub async fn setup_iptable(br_name: String) -> anyhow::Result<()> {
     )
     .await?;
 
-    let rule1 = format!("-i {} -o {br_name} -j ACCEPT", ext_iface.iface.name);
-    let rule2 = format!("-i {br_name} -o {} -j ACCEPT", ext_iface.iface.name);
+    // Get current ruleset
+    let current = tokio::task::spawn_blocking(nft_helper::get_current_ruleset)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))??;
 
-    ipt.insert("filter", "FORWARD", &rule1, 1)
-        .map_err(|e| anyhow::anyhow!("failed to insert rule1: {e}"))?;
-    ipt.insert("filter", "FORWARD", &rule2, 1)
-        .map_err(|e| anyhow::anyhow!("failed to insert rule2: {e}"))?;
+    // Check for existing table/chain
+    let table_exists = current.objects.iter().any(|obj| match obj {
+        NfObject::ListObject(NfListObject::Table(t)) => {
+            t.name == "filter" && t.family == NfFamily::IP
+        }
+        _ => false,
+    });
 
-    Ok(())
+    let chain_exists = current.objects.iter().any(|obj| match obj {
+        NfObject::ListObject(NfListObject::Chain(c)) => {
+            c.table == "filter" && c.family == NfFamily::IP && c.name == "FORWARD"
+        }
+        _ => false,
+    });
+
+    let mut objects: Vec<NfObject> = Vec::new();
+
+    if !table_exists {
+        let table = Table {
+            family: NfFamily::IP,
+            name: Cow::Owned("filter".to_string()),
+            handle: None,
+        };
+        objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Table(table))));
+    }
+
+    if !chain_exists {
+        let chain = Chain {
+            family: NfFamily::IP,
+            table: Cow::Owned("filter".to_string()),
+            name: Cow::Owned("FORWARD".to_string()),
+            hook: Some(nftables::types::NfHook::Forward),
+            ..Default::default()
+        };
+        objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Chain(chain))));
+    }
+
+    let comment = "libbridge-forward-accept".to_string();
+
+    let build_accept_rule = |iif: String, oif: String| {
+        let r = Rule {
+            family: NfFamily::IP,
+            table: Cow::Owned("filter".to_string()),
+            chain: Cow::Owned("FORWARD".to_string()),
+            comment: Some(Cow::Owned(comment.clone())),
+            expr: Cow::Owned(vec![
+                Statement::Match(StmtMatch {
+                    left: Expression::Named(NamedExpression::Meta(ExprMeta {
+                        key: MetaKey::Iifname,
+                    })),
+                    op: Operator::EQ,
+                    right: Expression::String(Cow::Owned(iif)),
+                }),
+                Statement::Match(StmtMatch {
+                    left: Expression::Named(NamedExpression::Meta(ExprMeta {
+                        key: MetaKey::Oifname,
+                    })),
+                    op: Operator::EQ,
+                    right: Expression::String(Cow::Owned(oif)),
+                }),
+                Statement::Accept(None),
+            ]),
+            ..Default::default()
+        };
+        NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(r)))
+    };
+
+    // Ensure a clean base: delete any existing rules with our comment, then re-add
+    let mut delete_objects: Vec<NfObject> = Vec::new();
+    for obj in current.objects.iter() {
+        if let NfObject::ListObject(listobj) = obj
+            && let NfListObject::Rule(r) = listobj
+            && let Some(comment) = &r.comment
+            && comment == "libbridge-forward-accept"
+        {
+            let del_rule = Rule {
+                family: r.family,
+                table: r.table.clone(),
+                chain: r.chain.clone(),
+                handle: r.handle,
+                expr: r.expr.clone(),
+                ..Default::default()
+            };
+            delete_objects.push(NfObject::CmdObject(NfCmd::Delete(NfListObject::Rule(
+                del_rule,
+            ))));
+        }
+    }
+
+    if !delete_objects.is_empty() {
+        let to_delete = Nftables {
+            objects: Cow::Owned(delete_objects),
+        };
+        let payload = serde_json::to_string(&to_delete)
+            .map_err(|e| anyhow::anyhow!(format!("failed to serialize delete payload: {e}")))?;
+
+        tokio::task::spawn_blocking(move || {
+            nft_helper::apply_ruleset_raw(
+                &payload,
+                nft_helper::DEFAULT_NFT,
+                nft_helper::DEFAULT_ARGS,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!(format!("failed to run nft helper task: {e}")))?
+        .map_err(|e| anyhow::anyhow!(format!("failed to delete existing nftables rules: {e}")))?;
+    }
+
+    // ext_iface -> br (recreate)
+    objects.push(build_accept_rule(
+        ext_iface.iface.name.clone(),
+        br_name.clone(),
+    ));
+    // br -> ext_iface (recreate)
+    objects.push(build_accept_rule(
+        br_name.clone(),
+        ext_iface.iface.name.clone(),
+    ));
+
+    if objects.is_empty() {
+        return Ok(());
+    }
+
+    let to_apply = Nftables {
+        objects: Cow::Owned(objects),
+    };
+
+    let res = tokio::task::spawn_blocking(move || nft_helper::apply_ruleset(&to_apply))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))?;
+
+    match res {
+        Ok(()) => Ok(()),
+        Err(e) => Err(anyhow::anyhow!("failed to apply nftables rules: {e}")),
+    }
 }
 
-pub async fn cleanup_iptable(br_name: String) -> anyhow::Result<()> {
-    let ipt = iptables::new(false).unwrap();
+pub async fn cleanup_bridge_nftable() -> anyhow::Result<()> {
+    // Find and delete rules we previously added (identified by comment)
+    let current = tokio::task::spawn_blocking(nft_helper::get_current_ruleset)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))??;
 
-    let ext_iface = lookup_ext_iface(
-        None,
-        None,
-        None,
-        IPStack::Ipv4,
-        PublicIPOpts {
-            public_ip: None,
-            public_ipv6: None,
-        },
-    )
-    .await?;
+    let nft = current;
 
-    let rule1 = format!("-i {} -o {br_name} -j ACCEPT", ext_iface.iface.name);
-    let rule2 = format!("-i {br_name} -o {} -j ACCEPT", ext_iface.iface.name);
+    let mut delete_objects: Vec<NfObject> = Vec::new();
 
-    ipt.delete("filter", "FORWARD", &rule1)
-        .map_err(|e| anyhow::anyhow!("failed to delete rule1: {e}"))?;
-    ipt.delete("filter", "FORWARD", &rule2)
-        .map_err(|e| anyhow::anyhow!("failed to delete rule2: {e}"))?;
+    for obj in nft.objects.iter() {
+        if let NfObject::ListObject(listobj) = obj
+            && let NfListObject::Rule(r) = listobj
+            && let Some(comment) = &r.comment
+            && comment == "libbridge-forward-accept"
+        {
+            let del_rule = Rule {
+                family: r.family,
+                table: r.table.clone(),
+                chain: r.chain.clone(),
+                handle: r.handle,
+                ..Default::default()
+            };
 
-    Ok(())
+            delete_objects.push(NfObject::CmdObject(NfCmd::Delete(NfListObject::Rule(
+                del_rule,
+            ))));
+        }
+    }
+
+    if delete_objects.is_empty() {
+        return Ok(());
+    }
+
+    let to_apply = Nftables {
+        objects: Cow::Owned(delete_objects),
+    };
+
+    let res = tokio::task::spawn_blocking(move || nft_helper::apply_ruleset(&to_apply))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))?;
+
+    match res {
+        Ok(()) => Ok(()),
+        Err(e) => Err(anyhow::anyhow!("failed to delete nftables rules: {e}")),
+    }
 }
 
 #[cfg(test)]

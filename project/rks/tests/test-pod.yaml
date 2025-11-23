@@ -6,7 +6,7 @@ metadata:
     app: my-app 
     bundle: ./project/rk8s/project/test/bundles/pause
 spec:
-  node_name: tcy-VMware-Virtual-Platform
+  node_name: node1
   containers:
     - name: container1    
       image: ./project/rk8s/project/test/bundles/busybox

@@ -45,6 +45,6 @@ rust_library(
         "//third-party/rust/crates/rustls-native-certs/0.6.3:rustls-native-certs",
         "//third-party/rust/crates/rustls/0.21.12:rustls",
         "//third-party/rust/crates/tokio-rustls/0.24.1:tokio-rustls",
-        "//third-party/rust/crates/tokio/1.47.1:tokio",
+        "//third-party/rust/crates/tokio/1.48.0:tokio",
     ],
 )

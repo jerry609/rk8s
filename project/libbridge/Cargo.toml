@@ -9,7 +9,7 @@ repository = "https://github.com/r2cn-dev/rk8s/tree/main/project/libbridge"
 [dependencies]
 libcni = { workspace = true }
 libnetwork = { workspace = true }
-iptables = { workspace = true }
+nftables = { workspace = true }
 cni-plugin = { workspace = true, features = ["with-smol"] }
 tokio = { workspace = true, features = ["full"] }
 futures = { workspace = true }

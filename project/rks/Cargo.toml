@@ -48,7 +48,7 @@ time = { workspace = true }
 hickory-server = { workspace = true, features = ["resolver"] }
 hickory-proto = { workspace = true }
 hickory-resolver = { workspace = true }
-iptables = { workspace = true }
+nftables = { workspace = true }
 axum = { workspace = true }
 humantime = { workspace = true }
 base64 = "0.20.0"

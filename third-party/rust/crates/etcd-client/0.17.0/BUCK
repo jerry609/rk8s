@@ -26,6 +26,7 @@ rust_library(
     env = {
         "OUT_DIR": "$(location :etcd-client-build-script-run[out_dir])",
     },
+    features = ["tls"],
     rustc_flags = [
         "@$(location :etcd-client-build-script-run[rustc_flags])",
         "@$(location :etcd-client-manifest[env_flags])",
@@ -35,7 +36,7 @@ rust_library(
         "//third-party/rust/crates/http/1.3.1:http",
         "//third-party/rust/crates/prost/0.14.1:prost",
         "//third-party/rust/crates/tokio-stream/0.1.17:tokio-stream",
-        "//third-party/rust/crates/tokio/1.47.1:tokio",
+        "//third-party/rust/crates/tokio/1.48.0:tokio",
         "//third-party/rust/crates/tonic-prost/0.14.2:tonic-prost",
         "//third-party/rust/crates/tonic/0.14.2:tonic",
         "//third-party/rust/crates/tower-service/0.3.3:tower-service",
@@ -49,6 +50,7 @@ rust_binary(
     crate = "build_script_build",
     crate_root = "vendor/build.rs",
     edition = "2021",
+    features = ["tls"],
     rustc_flags = ["@$(location :etcd-client-manifest[env_flags])"],
     visibility = [],
     deps = [
@@ -62,6 +64,7 @@ buildscript_run(
     package_name = "etcd-client",
     buildscript_rule = ":etcd-client-build-script-build",
     env_srcs = [":etcd-client-manifest[env_dict]"],
+    features = ["tls"],
     version = "0.17.0",
     manifest_dir = ":etcd-client-vendor",
     visibility = ["PUBLIC"],
