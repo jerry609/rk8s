@@ -505,6 +505,7 @@ impl Filesystem for OverlayFs {
             )
             .await
     }
+
     /// get filesystem statistics.
     async fn statfs(&self, req: Request, inode: Inode) -> Result<ReplyStatFs> {
         self.do_statvfs(req, inode).await.map_err(|e| e.into())
@@ -1059,6 +1060,10 @@ impl Filesystem for OverlayFs {
                 .lseek(req, real_inode, real_handle, offset, whence)
                 .await
         }
+    }
+
+    async fn interrupt(&self, _req: Request, _unique: u64) -> Result<()> {
+        Ok(())
     }
 }
 #[cfg(test)]
