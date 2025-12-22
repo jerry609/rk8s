@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::fmt;
 use std::time::SystemTime;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// File type enumeration
@@ -433,18 +434,16 @@ pub trait MetaStore: Send + Sync {
 
     // ---------- Session lifecycle ----------
 
-    async fn new_session(&self, session_info: SessionInfo) -> Result<Session, MetaError> {
-        let _ = session_info;
+    async fn start_session(
+        &self,
+        session_info: SessionInfo,
+        token: CancellationToken,
+    ) -> Result<Session, MetaError> {
+        let _ = (session_info, token);
         Err(MetaError::NotImplemented)
     }
 
-    async fn refresh_session(&self, session_id: Uuid) -> Result<(), MetaError> {
-        let _ = session_id;
-        Err(MetaError::NotImplemented)
-    }
-
-    async fn shutdown_session(&self, session_id: Uuid) -> Result<(), MetaError> {
-        let _ = session_id;
+    async fn shutdown_session(&self) -> Result<(), MetaError> {
         Err(MetaError::NotImplemented)
     }
 
@@ -452,7 +451,7 @@ pub trait MetaStore: Send + Sync {
         Err(MetaError::NotImplemented)
     }
 
-    async fn get_lock(&self, lock_name: LockName) -> bool {
+    async fn get_global_lock(&self, lock_name: LockName) -> bool {
         let _ = lock_name;
         true
     }
@@ -779,11 +778,6 @@ pub trait MetaStore: Send + Sync {
         pid: u32,
     ) -> Result<(), MetaError> {
         let _ = (inode, owner, lock_type, pid, block, range);
-        Err(MetaError::NotImplemented)
-    }
-
-    fn set_sid(&self, sid: Uuid) -> Result<(), MetaError> {
-        let _ = sid;
         Err(MetaError::NotImplemented)
     }
 }

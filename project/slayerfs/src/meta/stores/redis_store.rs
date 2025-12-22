@@ -25,6 +25,9 @@ use std::any::Any;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::select;
+use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 use uuid::Uuid;
 
@@ -39,6 +42,8 @@ const ALL_SESSIONS_KEY: &str = "allsessions";
 const SESSION_INFOS_KEY: &str = "sessioninfos";
 const PLOCK_PREFIX: &str = "plock";
 const LOCKS_KEY: &str = "locks";
+const LOCKED_KEY: &str = "locked";
+
 const CHUNK_ID_BASE: u64 = 1_000_000_000u64;
 
 /// Minimal Redis-backed meta store.
@@ -127,6 +132,10 @@ impl RedisMetaStore {
             }
         };
         Ok(suffix)
+    }
+
+    fn locked_key(sid: Uuid) -> String {
+        format!("{}{}", LOCKED_KEY, sid)
     }
 
     async fn init_root_directory(&self) -> Result<(), MetaError> {
@@ -374,7 +383,13 @@ impl RedisMetaStore {
 
                     if records.is_empty() {
                         // Remove the field if no records
-                        let _: () = conn.hdel(&plock_key, &field).await.map_err(redis_err)?;
+                        let _: () = redis::pipe()
+                            .atomic()
+                            .hdel(&plock_key, &field)
+                            .srem(Self::locked_key(*sid), inode)
+                            .exec_async(&mut conn)
+                            .await
+                            .map_err(redis_err)?;
                         return Ok(());
                     }
 
@@ -443,8 +458,11 @@ impl RedisMetaStore {
                 let new_json = serde_json::to_string(&new_records)
                     .map_err(|e| MetaError::Internal(format!("Serialization error: {e}")))?;
 
-                let _: () = conn
+                let _: () = redis::pipe()
+                    .atomic()
                     .hset(&plock_key, &field, new_json)
+                    .sadd(Self::locked_key(*sid), inode)
+                    .exec_async(&mut conn)
                     .await
                     .map_err(redis_err)?;
                 Ok(())
@@ -462,6 +480,54 @@ impl RedisMetaStore {
             pipe.cmd("RPUSH").arg(&key).arg(data);
         }
         pipe.query_async::<()>(&mut conn).await.map_err(redis_err)?;
+        Ok(())
+    }
+
+    async fn shutdown_session_by_id(&self, session_id: Uuid) -> Result<(), MetaError> {
+        let mut conn = self.conn.clone();
+        let session_id_string = session_id.to_string();
+
+        let locked_key = Self::locked_key(session_id);
+
+        let locked_files: Vec<i64> = conn
+            .smembers(&locked_key)
+            .await
+            .map_err(|e| MetaError::Internal(format!("Failed to get locked files: {}", e)))?;
+        let mut pipe = redis::pipe();
+        let pipe_atomic = pipe.atomic();
+        for file in locked_files {
+            let owners: Vec<String> = conn
+                .hkeys(self.plock_key(file))
+                .await
+                .map_err(|e| MetaError::Internal(e.to_string()))?;
+
+            let mut fields: Vec<String> = Vec::new();
+            for owner in owners {
+                let owner_sid = owner.split(':').next().ok_or_else(|| {
+                    MetaError::Internal(format!(
+                        "Malformed lock owner format in Redis: '{}'",
+                        owner
+                    ))
+                })?;
+                if owner_sid == session_id_string {
+                    fields.push(owner);
+                }
+            }
+
+            if !fields.is_empty() {
+                pipe_atomic.hdel(self.plock_key(file), &fields);
+            }
+
+            pipe_atomic.srem(&locked_key, file);
+        }
+
+        pipe_atomic
+            .zrem(ALL_SESSIONS_KEY, &session_id_string)
+            .hdel(SESSION_INFOS_KEY, &session_id_string)
+            .exec_async(&mut conn)
+            .await
+            .map_err(|err| MetaError::Internal(err.to_string()))?;
+
         Ok(())
     }
 
@@ -512,6 +578,52 @@ impl RedisMetaStore {
         }
 
         Ok(())
+    }
+    fn set_sid(&self, session_id: Uuid) -> Result<(), MetaError> {
+        self.sid
+            .set(session_id)
+            .map_err(|_| MetaError::Internal("sid has been set".to_string()))?;
+        Ok(())
+    }
+    fn get_sid(&self) -> Result<&Uuid, MetaError> {
+        self.sid
+            .get()
+            .ok_or_else(|| MetaError::Internal("sid has not been set".to_string()))
+    }
+
+    async fn refresh_session(
+        session_id: Uuid,
+        mut conn: ConnectionManager,
+    ) -> Result<(), MetaError> {
+        let session_id_string = session_id.to_string();
+        let expire = (Utc::now() + chrono::Duration::minutes(5)).timestamp_millis();
+        redis::Cmd::zadd(ALL_SESSIONS_KEY, session_id_string, expire)
+            .exec_async(&mut conn)
+            .await
+            .map_err(|err| MetaError::Internal(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn life_cycle(token: CancellationToken, session_id: Uuid, conn: ConnectionManager) {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            select! {
+                _ = interval.tick() => {
+                    // refresh session
+                    match Self::refresh_session(session_id, conn.clone()).await {
+                        Ok(_) => {}
+                        Err(err) => {
+                            error!("Failed to refresh session: {}", err);
+                        }
+                    }
+
+                }
+                _ = token.cancelled() => {
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -844,7 +956,11 @@ impl MetaStore for RedisMetaStore {
         self.alloc_id(key).await
     }
 
-    async fn new_session(&self, session_info: SessionInfo) -> Result<Session, MetaError> {
+    async fn start_session(
+        &self,
+        session_info: SessionInfo,
+        token: CancellationToken,
+    ) -> Result<Session, MetaError> {
         let mut conn = self.conn.clone();
 
         let session_id = Uuid::now_v7();
@@ -867,33 +983,20 @@ impl MetaStore for RedisMetaStore {
             .exec_async(&mut conn)
             .await
             .map_err(|err| MetaError::Internal(err.to_string()))?;
+        self.set_sid(session_id)?;
+
+        tokio::spawn(Self::life_cycle(
+            token.clone(),
+            session_id,
+            self.conn.clone(),
+        ));
 
         Ok(session)
     }
 
-    async fn refresh_session(&self, session_id: Uuid) -> Result<(), MetaError> {
-        let mut conn = self.conn.clone();
-        let session_id_string = session_id.to_string();
-        let expire = (Utc::now() + chrono::Duration::minutes(5)).timestamp_millis();
-        redis::Cmd::zadd(ALL_SESSIONS_KEY, session_id_string, expire)
-            .exec_async(&mut conn)
-            .await
-            .map_err(|err| MetaError::Internal(err.to_string()))?;
-        Ok(())
-    }
-
-    async fn shutdown_session(&self, session_id: Uuid) -> Result<(), MetaError> {
-        let mut conn = self.conn.clone();
-        let session_id_string = session_id.to_string();
-
-        redis::pipe()
-            .atomic()
-            .zrem(ALL_SESSIONS_KEY, &session_id_string)
-            .hdel(SESSION_INFOS_KEY, &session_id_string)
-            .exec_async(&mut conn)
-            .await
-            .map_err(|err| MetaError::Internal(err.to_string()))?;
-
+    async fn shutdown_session(&self) -> Result<(), MetaError> {
+        let session_id = self.get_sid()?;
+        self.shutdown_session_by_id(*session_id).await?;
         Ok(())
     }
 
@@ -907,12 +1010,12 @@ impl MetaStore for RedisMetaStore {
         for session in sessions {
             let session_id =
                 Uuid::from_str(&session).map_err(|err| MetaError::Internal(err.to_string()))?;
-            self.shutdown_session(session_id).await?;
+            self.shutdown_session_by_id(session_id).await?;
         }
         Ok(())
     }
 
-    async fn get_lock(&self, lock_name: LockName) -> bool {
+    async fn get_global_lock(&self, lock_name: LockName) -> bool {
         let lock_name = lock_name.to_string();
         let mut conn = self.conn.clone();
         let now = Utc::now().timestamp_millis();
@@ -975,7 +1078,7 @@ impl MetaStore for RedisMetaStore {
         let sid = self
             .sid
             .get()
-            .ok_or_else(|| MetaError::Internal("sid not seted".to_string()))?;
+            .ok_or_else(|| MetaError::Internal("sid not set".to_string()))?;
 
         // First, try to get locks from current session's field
         let current_field = format!("{}:{}", sid, query.owner);
@@ -1052,12 +1155,6 @@ impl MetaStore for RedisMetaStore {
                 Err(e) => return Err(e),
             }
         }
-    }
-
-    fn set_sid(&self, sid: Uuid) -> Result<(), MetaError> {
-        self.sid
-            .set(sid)
-            .map_err(|_| MetaError::Internal("sid already been set".to_string()))
     }
 }
 

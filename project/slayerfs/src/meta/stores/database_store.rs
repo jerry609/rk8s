@@ -20,8 +20,13 @@ use crate::vfs::fs::FileType;
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use log::info;
+use sea_orm::ActiveValue::{self, Set, Unchanged};
 use sea_orm::prelude::Uuid;
-use sea_orm::*;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection,
+    EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, Schema,
+    TransactionTrait, sea_query,
+};
 use sea_query::Index;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -29,6 +34,9 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::select;
+use tokio_util::sync::CancellationToken;
+use tracing::error;
 
 #[derive(Eq, Hash, PartialEq)]
 struct PlockHashMapKey {
@@ -550,7 +558,7 @@ impl DatabaseMetaStore {
         Ok(flag)
     }
 
-    async fn shutdown_session_internal<C: ConnectionTrait>(
+    async fn shutdown_session_by_id<C: ConnectionTrait>(
         &self,
         session_id: Uuid,
         conn: &C,
@@ -564,6 +572,11 @@ impl DatabaseMetaStore {
             None => return Err(MetaError::SessionNotFound(session_id)),
         };
         session.delete(conn).await.map_err(MetaError::Database)?;
+
+        PlockMeta::delete_many()
+            .filter(plock_meta::Column::Sid.eq(session_id))
+            .exec(conn)
+            .await?;
         Ok(())
     }
     async fn try_set_plock(
@@ -589,7 +602,7 @@ impl DatabaseMetaStore {
         let sid = self
             .sid
             .get()
-            .ok_or_else(|| MetaError::Internal("sid not seted".to_string()))?;
+            .ok_or_else(|| MetaError::Internal("sid not set".to_string()))?;
 
         match lock_type {
             FileLockType::UnLock => {
@@ -719,6 +732,57 @@ impl DatabaseMetaStore {
 
                 txn.commit().await.map_err(MetaError::Database)?;
                 Ok(())
+            }
+        }
+    }
+
+    fn set_sid(&self, session_id: Uuid) -> Result<(), MetaError> {
+        self.sid
+            .set(session_id)
+            .map_err(|_| MetaError::Internal("sid has been set".to_string()))?;
+        Ok(())
+    }
+
+    fn get_sid(&self) -> Result<&Uuid, MetaError> {
+        self.sid
+            .get()
+            .ok_or_else(|| MetaError::Internal("sid has not been set".to_string()))
+    }
+
+    async fn refresh_session(session_id: Uuid, conn: &DatabaseConnection) -> Result<(), MetaError> {
+        let txn = conn.begin().await.map_err(MetaError::Database)?;
+        let expire = (Utc::now() + ChronoDuration::minutes(5)).timestamp_millis();
+        let session = SessionMeta::find()
+            .filter(session_meta::Column::SessionId.eq(session_id))
+            .one(&txn)
+            .await?;
+        let mut session = match session {
+            Some(s) => s.into_active_model(),
+            None => return Err(MetaError::SessionNotFound(session_id)),
+        };
+        session.expire = Set(expire);
+        session.update(&txn).await.map_err(MetaError::Database)?;
+        txn.commit().await.map_err(MetaError::Database)?;
+        Ok(())
+    }
+
+    async fn life_cycle(token: CancellationToken, session_id: Uuid, conn: DatabaseConnection) {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            select! {
+                _ = interval.tick() => {
+                    // refresh session
+                    match Self::refresh_session(session_id, &conn).await {
+                        Ok(_) => {}
+                        Err(err) => {
+                            error!("Failed to refresh session: {}", err);
+                        }
+                    }
+
+                }
+                _ = token.cancelled() => {
+                    break;
+                }
             }
         }
     }
@@ -1758,7 +1822,11 @@ impl MetaStore for DatabaseMetaStore {
 
     // ---------- Session lifecycle implementation ----------
 
-    async fn new_session(&self, session_info: SessionInfo) -> Result<Session, MetaError> {
+    async fn start_session(
+        &self,
+        session_info: SessionInfo,
+        token: CancellationToken,
+    ) -> Result<Session, MetaError> {
         let txn = self.db.begin().await.map_err(MetaError::Database)?;
         let session_id = Uuid::now_v7();
         let expire = (Utc::now() + ChronoDuration::minutes(5)).timestamp_millis();
@@ -1772,7 +1840,11 @@ impl MetaStore for DatabaseMetaStore {
             let _ = txn.rollback().await;
             return Err(MetaError::Database(e));
         }
+        self.set_sid(session_id)?;
         txn.commit().await.map_err(MetaError::Database)?;
+
+        tokio::spawn(Self::life_cycle(token.clone(), session_id, self.db.clone()));
+
         Ok(Session {
             session_id,
             expire,
@@ -1780,26 +1852,10 @@ impl MetaStore for DatabaseMetaStore {
         })
     }
 
-    async fn refresh_session(&self, session_id: Uuid) -> Result<(), MetaError> {
+    async fn shutdown_session(&self) -> Result<(), MetaError> {
         let txn = self.db.begin().await.map_err(MetaError::Database)?;
-        let expire = (Utc::now() + ChronoDuration::minutes(5)).timestamp_millis();
-        let session = SessionMeta::find()
-            .filter(session_meta::Column::SessionId.eq(session_id))
-            .one(&txn)
-            .await?;
-        let mut session = match session {
-            Some(s) => s.into_active_model(),
-            None => return Err(MetaError::SessionNotFound(session_id)),
-        };
-        session.expire = Set(expire);
-        session.update(&txn).await.map_err(MetaError::Database)?;
-        txn.commit().await.map_err(MetaError::Database)?;
-        Ok(())
-    }
-
-    async fn shutdown_session(&self, session_id: Uuid) -> Result<(), MetaError> {
-        let txn = self.db.begin().await.map_err(MetaError::Database)?;
-        self.shutdown_session_internal(session_id, &txn).await?;
+        let session_id = self.get_sid()?;
+        self.shutdown_session_by_id(*session_id, &txn).await?;
         txn.commit().await.map_err(MetaError::Database)?;
         Ok(())
     }
@@ -1812,14 +1868,14 @@ impl MetaStore for DatabaseMetaStore {
             .await?;
         for session in sessions {
             let session_id = session.session_id;
-            self.shutdown_session_internal(session_id, &txn).await?;
+            self.shutdown_session_by_id(session_id, &txn).await?;
         }
 
         txn.commit().await.map_err(MetaError::Database)?;
         Ok(())
     }
 
-    async fn get_lock(&self, lock_name: LockName) -> bool {
+    async fn get_global_lock(&self, lock_name: LockName) -> bool {
         self.get_lock_internal(lock_name).await.unwrap_or_default()
     }
 
@@ -1836,7 +1892,7 @@ impl MetaStore for DatabaseMetaStore {
         let sid = self
             .sid
             .get()
-            .ok_or_else(|| MetaError::Internal("sid not seted".to_string()))?;
+            .ok_or_else(|| MetaError::Internal("sid not set".to_string()))?;
 
         let rows = PlockMeta::find()
             .filter(plock_meta::Column::Inode.eq(inode))
@@ -1889,12 +1945,6 @@ impl MetaStore for DatabaseMetaStore {
                 Err(e) => return Err(e),
             }
         }
-    }
-
-    fn set_sid(&self, sid: Uuid) -> Result<(), MetaError> {
-        self.sid
-            .set(sid)
-            .map_err(|_| MetaError::Internal("sid has been seted".to_string()))
     }
 }
 
