@@ -2,6 +2,7 @@ use crate::api::xlinestore::XlineStore;
 use crate::commands::{create, delete};
 use chrono::Utc;
 use common::quic::RksConnection;
+use common::*;
 use common::{Node, NodeStatus, PodTask, RksMessage};
 use log::{error, info, warn};
 use std::sync::Arc;
@@ -75,6 +76,15 @@ pub async fn dispatch_user(
         }
         RksMessage::CreateReplicaSet(mut rs) => {
             let name = rs.metadata.name.clone();
+            if xline_store
+                .get_replicaset_yaml(&rs.metadata.name)
+                .await?
+                .is_some()
+            {
+                let err_msg = format!("rs \"{}\" already exists", rs.metadata.name);
+                conn.send_msg(&RksMessage::Error(err_msg)).await?;
+                return Ok(());
+            }
             // Set creation_timestamp if not already set
             if rs.metadata.creation_timestamp.is_none() {
                 rs.metadata.creation_timestamp = Some(Utc::now());
@@ -88,14 +98,24 @@ pub async fn dispatch_user(
             conn.send_msg(&RksMessage::Ack).await?;
         }
 
-        RksMessage::UpdateReplicaSet(rs) => {
-            let name = rs.metadata.name.clone();
-            let yaml = serde_yaml::to_string(&*rs)?;
-            xline_store.insert_replicaset_yaml(&name, &yaml).await?;
-            info!(
-                target: "rks::node::user_dispatch",
-                "updated ReplicaSet {name}"
-            );
+        RksMessage::UpdateReplicaSet(incoming_rs) => {
+            let name = incoming_rs.metadata.name.clone();
+            if let Some(existing_yaml) = xline_store.get_replicaset_yaml(&name).await? {
+                let mut final_rs: common::ReplicaSet = serde_yaml::from_str(&existing_yaml)?;
+                if final_rs.spec != incoming_rs.spec {
+                    let current_gen = final_rs.metadata.generation.unwrap_or(0);
+                    final_rs.metadata.generation = Some(current_gen + 1);
+                    final_rs.spec = incoming_rs.spec.clone();
+
+                    info!(target: "rks::node::user_dispatch", "ReplicaSet {} spec updated, add generation", name);
+                }
+                let yaml = serde_yaml::to_string(&final_rs)?;
+                xline_store.insert_replicaset_yaml(&name, &yaml).await?;
+                info!(target: "rks::node::user_dispatch", "updated ReplicaSet {name} (preserved state)");
+            } else {
+                let yaml = serde_yaml::to_string(&*incoming_rs)?;
+                xline_store.insert_replicaset_yaml(&name, &yaml).await?;
+            }
             conn.send_msg(&RksMessage::Ack).await?;
         }
 
@@ -139,6 +159,146 @@ pub async fn dispatch_user(
                 rss.len()
             );
             conn.send_msg(&RksMessage::ListReplicaSetRes(rss)).await?;
+        }
+
+        // Deployment operations
+        RksMessage::CreateDeployment(mut deploy) => {
+            if xline_store
+                .get_deployment_yaml(&deploy.metadata.name)
+                .await?
+                .is_some()
+            {
+                let err_msg = format!("deployment \"{}\" already exists", deploy.metadata.name);
+                conn.send_msg(&RksMessage::Error(err_msg)).await?;
+                return Ok(());
+            }
+            let name = deploy.metadata.name.clone();
+            if deploy.metadata.creation_timestamp.is_none() {
+                deploy.metadata.creation_timestamp = Some(Utc::now());
+            }
+            let yaml = serde_yaml::to_string(&*deploy)?;
+            xline_store.insert_deployment_yaml(&name, &yaml).await?;
+            info!(
+                target: "rks::node::user_dispatch",
+                "created Deployment {name}"
+            );
+            conn.send_msg(&RksMessage::Ack).await?;
+        }
+        RksMessage::UpdateDeployment(incoming_deploy) => {
+            let name = incoming_deploy.metadata.name.clone();
+            if let Some(existing_yaml) = xline_store.get_deployment_yaml(&name).await? {
+                let mut final_deploy: Deployment = serde_yaml::from_str(&existing_yaml)?;
+                if final_deploy.spec != incoming_deploy.spec {
+                    let current_gen = final_deploy.metadata.generation.unwrap_or(0);
+                    final_deploy.metadata.generation = Some(current_gen + 1);
+                    final_deploy.spec = incoming_deploy.spec.clone();
+                    info!(
+                        "Deployment {} spec updated, add generation to {}",
+                        name,
+                        current_gen + 1
+                    );
+                }
+                let yaml = serde_yaml::to_string(&final_deploy)?;
+                xline_store.insert_deployment_yaml(&name, &yaml).await?;
+            } else {
+                let new_deploy = *incoming_deploy;
+                let yaml = serde_yaml::to_string(&new_deploy)?;
+                xline_store.insert_deployment_yaml(&name, &yaml).await?;
+            }
+            conn.send_msg(&RksMessage::Ack).await?;
+        }
+
+        RksMessage::DeleteDeployment(name) => {
+            xline_store
+                .delete_object(
+                    common::ResourceKind::Deployment,
+                    &name,
+                    common::DeletePropagationPolicy::Background,
+                )
+                .await?;
+            info!(
+                target: "rks::node::user_dispatch",
+                "marked Deployment {} for deletion (background policy)",
+                name
+            );
+            conn.send_msg(&RksMessage::Ack).await?;
+        }
+
+        RksMessage::GetDeployment(name) => {
+            if let Some(deploy) = xline_store.get_deployment(&name).await? {
+                info!(
+                    target: "rks::node::user_dispatch",
+                    "retrieved Deployment {name}"
+                );
+                conn.send_msg(&RksMessage::GetDeploymentRes(Box::new(deploy)))
+                    .await?;
+            } else {
+                conn.send_msg(&RksMessage::Error(format!("Deployment {} not found", name)))
+                    .await?;
+            }
+        }
+
+        RksMessage::ListDeployment => {
+            let deps = xline_store.list_deployments().await?;
+            info!(
+                target: "rks::node::user_dispatch",
+                "list current deployments: {} items",
+                deps.len()
+            );
+            conn.send_msg(&RksMessage::ListDeploymentRes(deps)).await?;
+        }
+
+        RksMessage::RollbackDeployment { name, revision } => {
+            use crate::controllers::deployment::DeploymentController;
+            let controller = DeploymentController::new(xline_store.clone());
+            match controller.rollback_to_revision(&name, revision).await {
+                Ok(()) => {
+                    info!(
+                        target: "rks::node::user_dispatch",
+                        "rolled back Deployment {} to revision {}",
+                        name,
+                        if revision == 0 { "previous".to_string() } else { revision.to_string() }
+                    );
+                    conn.send_msg(&RksMessage::Ack).await?;
+                }
+                Err(e) => {
+                    conn.send_msg(&RksMessage::Error(format!("Rollback failed: {}", e)))
+                        .await?;
+                }
+            }
+        }
+
+        RksMessage::GetDeploymentHistory(name) => {
+            use crate::controllers::deployment::DeploymentController;
+            let controller = DeploymentController::new(xline_store.clone());
+            match controller.get_deployment_revision_history(&name).await {
+                Ok(history) => {
+                    let history_info: Vec<common::DeploymentRevisionInfo> = history
+                        .into_iter()
+                        .map(|h| common::DeploymentRevisionInfo {
+                            revision: h.revision,
+                            revision_history: h.revision_history,
+                            replicaset_name: h.replicaset_name,
+                            created_at: h.created_at,
+                            replicas: h.replicas,
+                            image: h.image,
+                            is_current: h.is_current,
+                        })
+                        .collect();
+                    info!(
+                        target: "rks::node::user_dispatch",
+                        "retrieved Deployment {} history: {} revisions",
+                        name,
+                        history_info.len()
+                    );
+                    conn.send_msg(&RksMessage::DeploymentHistoryRes(history_info))
+                        .await?;
+                }
+                Err(e) => {
+                    conn.send_msg(&RksMessage::Error(format!("Failed to get history: {}", e)))
+                        .await?;
+                }
+            }
         }
 
         RksMessage::GetNodeCount => {
