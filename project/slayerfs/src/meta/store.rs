@@ -362,6 +362,18 @@ pub trait MetaStore: Send + Sync {
 
     async fn readdir(&self, ino: i64) -> Result<Vec<DirEntry>, MetaError>;
 
+    /// Batch query attributes for multiple inodes (for optimization)
+    /// Returns attributes in the same order as input inodes
+    /// Returns None for inodes that don't exist
+    async fn batch_stat(&self, inodes: &[i64]) -> Result<Vec<Option<FileAttr>>, MetaError> {
+        // Default implementation: fallback to sequential queries
+        let mut results = Vec::with_capacity(inodes.len());
+        for &ino in inodes {
+            results.push(self.stat(ino).await?);
+        }
+        Ok(results)
+    }
+
     async fn mkdir(&self, parent: i64, name: String) -> Result<i64, MetaError>;
 
     async fn rmdir(&self, parent: i64, name: &str) -> Result<(), MetaError>;

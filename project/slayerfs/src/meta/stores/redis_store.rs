@@ -637,6 +637,37 @@ impl MetaStore for RedisMetaStore {
         Ok(self.get_node(ino).await?.map(|n| n.as_file_attr()))
     }
 
+    /// Batch stat implementation using Redis MGET for optimal performance
+    async fn batch_stat(&self, inodes: &[i64]) -> Result<Vec<Option<FileAttr>>, MetaError> {
+        if inodes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build keys for all inodes
+        let keys: Vec<String> = inodes.iter().map(|&ino| self.node_key(ino)).collect();
+
+        // Use MGET to fetch all nodes in a single round trip
+        let mut conn = self.conn.clone();
+        let values: Vec<Option<String>> = conn.get(&keys).await.map_err(redis_err)?;
+
+        // Parse results and convert to FileAttr
+        let mut results = Vec::with_capacity(inodes.len());
+        for value in values {
+            match value {
+                Some(json_str) => match serde_json::from_str::<StoredNode>(&json_str) {
+                    Ok(node) => results.push(Some(node.as_file_attr())),
+                    Err(e) => {
+                        error!("Failed to deserialize node from Redis: {}", e);
+                        results.push(None);
+                    }
+                },
+                None => results.push(None),
+            }
+        }
+
+        Ok(results)
+    }
+
     async fn lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
         self.directory_child(parent, name).await
     }
@@ -1423,7 +1454,7 @@ mod tests {
 
         // Verify lock exists
         let query = FileLockQuery {
-            owner: owner,
+            owner,
             lock_type: FileLockType::Read,
             range: FileLockRange { start: 0, end: 100 },
         };
@@ -1589,7 +1620,7 @@ mod tests {
 
         // Verify lock exists
         let query = FileLockQuery {
-            owner: owner,
+            owner,
             lock_type: FileLockType::Write,
             range: FileLockRange { start: 0, end: 100 },
         };
@@ -1635,7 +1666,7 @@ mod tests {
         store1
             .set_plock(
                 file_ino,
-                owner1 as i64,
+                owner1,
                 false,
                 FileLockType::Write,
                 FileLockRange { start: 0, end: 100 },
@@ -1649,7 +1680,7 @@ mod tests {
         store2
             .set_plock(
                 file_ino,
-                owner2 as i64,
+                owner2,
                 false,
                 FileLockType::Write,
                 FileLockRange {
@@ -1729,7 +1760,7 @@ mod tests {
             store2
                 .set_plock(
                     file_ino,
-                    owner2 as i64,
+                    owner2,
                     false,
                     FileLockType::Read,
                     FileLockRange {
@@ -1748,7 +1779,7 @@ mod tests {
             let result = store3
                 .set_plock(
                     file_ino,
-                    owner3 as i64,
+                    owner3,
                     false,
                     FileLockType::Write,
                     FileLockRange {

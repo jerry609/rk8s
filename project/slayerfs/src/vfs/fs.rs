@@ -1118,7 +1118,7 @@ where
     }
 
     /// Open a directory handle for reading. Returns the file handle ID.
-    /// This pre-loads all directory entries to support efficient pagination.
+    /// This pre-loads all directory entries and starts background batch prefetch for attributes.
     pub async fn opendir_handle(&self, ino: i64) -> Result<u64, MetaError> {
         // Verify directory exists
         let attr = self
@@ -1135,8 +1135,11 @@ where
         // Load all directory entries
         let entries = self.core.meta_layer.readdir(ino).await?;
 
-        // Create handle
-        let handle = DirHandle::new(ino, entries);
+        // Start background batch prefetch task
+        let (done_flag, prefetch_task) = self.core.meta_layer.spawn_batch_prefetch(ino, &entries);
+
+        // Create handle with prefetch task
+        let handle = DirHandle::with_prefetch_task(ino, entries, prefetch_task, done_flag);
         let fh = self.state.handles.allocate_dir(handle).await;
 
         Ok(fh)
@@ -1157,6 +1160,18 @@ where
             handle.ino,
             handle.entries.len()
         );
+
+        // Check if prefetch task is still running
+        let is_done = handle.prefetch_done.load(Ordering::Acquire);
+        if !is_done {
+            tracing::debug!(
+                "Dir handle fh={}, ino={} released while prefetch still running - task will be aborted on drop",
+                fh,
+                handle.ino
+            );
+        }
+        // When handle is dropped (Arc refcount reaches 0), DirHandle::drop() will abort the task
+
         Ok(())
     }
 

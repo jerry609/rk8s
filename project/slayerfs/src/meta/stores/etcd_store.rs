@@ -21,7 +21,9 @@ use crate::meta::{INODE_ID_KEY, Permission};
 use crate::vfs::fs::FileType;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use etcd_client::{Client as EtcdClient, Compare, CompareOp, LeaseKeeper, PutOptions, Txn, TxnOp};
+use etcd_client::{
+    Client as EtcdClient, Compare, CompareOp, LeaseKeeper, PutOptions, Txn, TxnOp, TxnOpResponse,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json;
@@ -212,9 +214,30 @@ impl EtcdMetaStore {
 
     /// Initialize root directory
     async fn init_root_directory(&self) -> Result<(), MetaError> {
+        let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        // Create children key for root directory
         let children_key = Self::etcd_children_key(1);
         let root_children = EtcdDirChildren::new(1, HashMap::new());
         let children_json = serde_json::to_string(&root_children)?;
+
+        // Create reverse key (metadata) for root directory
+        let reverse_key = Self::etcd_reverse_key(1);
+        let root_entry = EtcdEntryInfo {
+            is_file: false,
+            size: None,
+            version: None,
+            permission: Permission::new(0o40755, 0, 0),
+            access_time: now,
+            modify_time: now,
+            create_time: now,
+            nlink: 2,
+            parent_inode: 1, // Root's parent is itself
+            entry_name: "/".to_string(),
+            deleted: false,
+            symlink_target: None,
+        };
+        let reverse_json = serde_json::to_string(&root_entry)?;
 
         let mut client = self.client.clone();
 
@@ -222,7 +245,10 @@ impl EtcdMetaStore {
         // version == 0 means the key is currently not present
         let txn = Txn::new()
             .when([Compare::version(children_key.clone(), CompareOp::Equal, 0)])
-            .and_then([TxnOp::put(children_key.clone(), children_json, None)]);
+            .and_then([
+                TxnOp::put(children_key.clone(), children_json, None),
+                TxnOp::put(reverse_key, reverse_json, None),
+            ]);
 
         let resp = client.txn(txn).await.map_err(|e| {
             MetaError::Config(format!("Failed to initialize root directory: {}", e))
@@ -1176,50 +1202,95 @@ impl EtcdMetaStore {
 
 #[async_trait]
 impl MetaStore for EtcdMetaStore {
-    async fn stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
-        if let Ok(Some(file_meta)) = self.get_file_meta(ino).await {
-            let permission = file_meta.permission();
-            let kind = if file_meta.symlink_target.is_some() {
-                FileType::Symlink
-            } else {
-                FileType::File
-            };
-            let size = if let Some(target) = &file_meta.symlink_target {
-                target.len() as u64
-            } else {
-                file_meta.size as u64
-            };
-            return Ok(Some(FileAttr {
-                ino: file_meta.inode,
-                size,
-                kind,
-                mode: permission.mode,
-                uid: permission.uid,
-                gid: permission.gid,
-                atime: file_meta.access_time,
-                mtime: file_meta.modify_time,
-                ctime: file_meta.create_time,
-                nlink: file_meta.nlink as u32,
-            }));
-        }
+    fn name(&self) -> &'static str {
+        "etcd"
+    }
 
-        if let Ok(Some(access_meta)) = self.get_access_meta(ino).await {
-            let permission = access_meta.permission();
-            return Ok(Some(FileAttr {
-                ino: access_meta.inode,
-                size: 4096,
-                kind: FileType::Dir,
-                mode: permission.mode,
-                uid: permission.uid,
-                gid: permission.gid,
-                atime: access_meta.access_time,
-                mtime: access_meta.modify_time,
-                ctime: access_meta.create_time,
-                nlink: access_meta.nlink as u32,
-            }));
+    async fn stat(&self, ino: i64) -> Result<Option<FileAttr>, MetaError> {
+        // Query reverse index once to get all metadata
+        let reverse_key = Self::etcd_reverse_key(ino);
+        if let Ok(Some(entry_info)) = self
+            .etcd_get_json_lenient::<EtcdEntryInfo>(&reverse_key)
+            .await
+        {
+            return Ok(Some(entry_info.to_file_attr(ino)));
         }
 
         Ok(None)
+    }
+
+    /// Batch stat implementation for Etcd using Transaction batch GET
+    /// Uses single transaction to fetch multiple keys - much faster than sequential queries
+    async fn batch_stat(&self, inodes: &[i64]) -> Result<Vec<Option<FileAttr>>, MetaError> {
+        if inodes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Etcd transaction has ~128 operations limit, process in chunks
+        const MAX_KEYS_PER_TXN: usize = 100;
+
+        let mut results: Vec<Option<FileAttr>> = vec![None; inodes.len()];
+
+        // Process in chunks to respect Etcd transaction limits
+        for (chunk_idx, chunk) in inodes.chunks(MAX_KEYS_PER_TXN).enumerate() {
+            let chunk_offset = chunk_idx * MAX_KEYS_PER_TXN;
+
+            // Build transaction with GET operations for all inodes in chunk
+            let mut get_ops = Vec::new();
+            for &ino in chunk {
+                let reverse_key = Self::etcd_reverse_key(ino);
+                get_ops.push(TxnOp::get(reverse_key.as_bytes(), None));
+            }
+
+            // Execute transaction - all GETs in single round trip
+            let mut client_clone = self.client.clone();
+            let txn = Txn::new().and_then(get_ops);
+            let txn_response = client_clone
+                .txn(txn)
+                .await
+                .map_err(|e| MetaError::Internal(format!("Etcd batch txn error: {}", e)))?;
+
+            let responses = txn_response.op_responses();
+
+            // Parse responses - one response per inode
+            for (i, &ino) in chunk.iter().enumerate() {
+                let result_idx = chunk_offset + i;
+
+                // Handle special case for root inode
+                if ino == 1 {
+                    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                    results[result_idx] = Some(FileAttr {
+                        ino: 1,
+                        size: 4096,
+                        kind: FileType::Dir,
+                        mode: 0o40755,
+                        uid: 0,
+                        gid: 0,
+                        atime: now,
+                        mtime: now,
+                        ctime: now,
+                        nlink: 2,
+                    });
+                    continue;
+                }
+
+                // Get response for this inode
+                if let Some(resp) = responses.get(i) {
+                    // TxnOpResponse is an enum, match to extract GetResponse
+                    if let TxnOpResponse::Get(range_resp) = resp
+                        && let Some(kv) = range_resp.kvs().first()
+                    {
+                        // Parse EtcdEntryInfo from the value
+                        if let Ok(entry_info) = serde_json::from_slice::<EtcdEntryInfo>(kv.value())
+                        {
+                            results[result_idx] = Some(entry_info.to_file_attr(ino));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     async fn lookup(&self, parent: i64, name: &str) -> Result<Option<i64>, MetaError> {
@@ -2950,7 +3021,7 @@ mod tests {
         store1
             .set_plock(
                 file_ino,
-                owner1 as i64,
+                owner1,
                 false,
                 FileLockType::Write,
                 FileLockRange { start: 0, end: 100 },
@@ -2964,7 +3035,7 @@ mod tests {
         store2
             .set_plock(
                 file_ino,
-                owner2 as i64,
+                owner2,
                 false,
                 FileLockType::Write,
                 FileLockRange {
@@ -3044,7 +3115,7 @@ mod tests {
             store2
                 .set_plock(
                     file_ino,
-                    owner2 as i64,
+                    owner2,
                     false,
                     FileLockType::Read,
                     FileLockRange {
@@ -3063,7 +3134,7 @@ mod tests {
             let result = store3
                 .set_plock(
                     file_ino,
-                    owner3 as i64,
+                    owner3,
                     false,
                     FileLockType::Write,
                     FileLockRange {
