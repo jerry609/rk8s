@@ -936,8 +936,10 @@ impl EtcdMetaStore {
             .sid
             .get()
             .ok_or_else(|| MetaError::Internal("sid not set".to_string()))?;
-        let lease = *self.get_lease()?;
-        let put_options = Some(PutOptions::new().with_lease(lease));
+        let put_options = self
+            .lease
+            .get()
+            .map(|lease| PutOptions::new().with_lease(*lease));
 
         match lock_type {
             FileLockType::UnLock => {
@@ -2673,8 +2675,38 @@ mod tests {
     use crate::meta::file_lock::{FileLockQuery, FileLockRange, FileLockType};
     use crate::meta::store::MetaError;
     use crate::meta::stores::EtcdMetaStore;
+    use serial_test::serial;
     use tokio::time;
     use uuid::Uuid;
+
+    async fn cleanup_test_data() -> Result<(), MetaError> {
+        use etcd_client::GetOptions;
+
+        let mut client =
+            crate::meta::stores::etcd_store::EtcdClient::connect(vec!["127.0.0.1:2379"], None)
+                .await
+                .map_err(|e| MetaError::Config(format!("Failed to connect to etcd: {}", e)))?;
+
+        let resp = client
+            .get("", Some(GetOptions::new().with_prefix()))
+            .await
+            .map_err(|e| MetaError::Internal(format!("Failed to get etcd keys: {}", e)))?;
+
+        for kv in resp.kvs() {
+            let key = String::from_utf8_lossy(kv.key());
+            client
+                .delete(key.as_ref(), None)
+                .await
+                .map_err(|e| MetaError::Internal(format!("Failed to delete key {}: {}", key, e)))?;
+        }
+
+        let config = test_config();
+        let _store = EtcdMetaStore::from_config(config.clone())
+            .await
+            .map_err(|e| MetaError::Internal(format!("Failed to reinitialize root: {}", e)))?;
+
+        Ok(())
+    }
 
     fn test_config() -> Config {
         Config {
@@ -2702,6 +2734,10 @@ mod tests {
     }
 
     async fn new_test_store() -> EtcdMetaStore {
+        if let Err(e) = cleanup_test_data().await {
+            eprintln!("Failed to cleanup etcd test data: {}", e);
+        }
+
         EtcdMetaStore::from_config(test_config())
             .await
             .expect("Failed to create test database store")
@@ -2778,6 +2814,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_basic_read_lock() {
         let store = new_test_store().await;
@@ -2818,6 +2855,7 @@ mod tests {
         assert_eq!(lock_info.lock_type, FileLockType::UnLock);
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_multiple_read_locks() {
         // Create session manager with 2 sessions
@@ -2830,7 +2868,10 @@ mod tests {
         let store1 = session_mgr.get_store(0);
         let parent = store1.root_ino();
         let file_ino = store1
-            .create_file(parent, "test_multiple_read_locks_file.txt".to_string())
+            .create_file(
+                parent,
+                format!("test_multiple_read_locks_{}.txt", Uuid::now_v7()),
+            )
             .await
             .unwrap();
 
@@ -2884,6 +2925,7 @@ mod tests {
         assert_eq!(lock_info2.lock_type, FileLockType::UnLock);
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_write_lock_conflict() {
         // Create session manager with 2 sessions
@@ -2945,6 +2987,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_lock_release() {
         let session_id = Uuid::now_v7();
@@ -3001,6 +3044,7 @@ mod tests {
         assert_eq!(lock_info.lock_type, FileLockType::UnLock);
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_non_overlapping_locks() {
         // Create session manager with 2 sessions
@@ -3076,6 +3120,7 @@ mod tests {
         assert_eq!(lock_info2.pid, 5678);
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_concurrent_read_write_locks() {
         // Test multiple sessions acquiring different types of locks
@@ -3183,6 +3228,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_cross_session_lock_visibility() {
         // Test that locks set by one session are visible to another session
