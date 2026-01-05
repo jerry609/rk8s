@@ -8,6 +8,7 @@ pub mod chuck;
 pub mod daemon;
 pub mod fuse;
 pub mod meta;
+pub mod sdk_fs;
 pub mod vfs;
 
 pub(crate) mod utils;

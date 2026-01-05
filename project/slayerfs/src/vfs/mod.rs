@@ -15,9 +15,8 @@
 //! Submodules:
 //! - `handles`: file and directory handle management
 //! - `cache`: caching helpers and policies
-pub(crate) mod backend;
-pub(crate) mod cache;
-pub mod config;
+pub mod cache;
+pub mod demo;
 pub mod error;
 pub mod fs;
 pub(crate) mod handles;
