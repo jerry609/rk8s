@@ -536,6 +536,16 @@ where
             return Ok(0);
         }
 
+        // Lock the corresponding writer so a concurrent writer can't append a new slice while
+        // we are sampling chunk metadata. Without this guard, the per-chunk readers could see
+        // a stale slice set and end up reading the wrong data.
+        //
+        // This lock MUST be acquired before checking file_size to ensure we see a consistent
+        // view of the file. Otherwise, a concurrent write could be in progress but not yet
+        // reflected in the file size, causing us to return early with stale/empty data.
+        let writer_guard = self.writer.read().await;
+
+        // Check file size and adjust read length if necessary
         let file_size = self.inode.file_size();
         if file_size <= offset {
             return Ok(0);

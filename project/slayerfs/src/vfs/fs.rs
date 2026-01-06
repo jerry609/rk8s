@@ -6,7 +6,7 @@ use crate::meta::MetaLayer;
 use crate::meta::client::{MetaClient, MetaClientOptions};
 use crate::meta::config::{CacheCapacity, CacheTtl};
 use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
-use crate::meta::store::{MetaError, MetaStore, SetAttrFlags, SetAttrRequest};
+use crate::meta::store::{MetaError, MetaStore, SetAttrFlags, SetAttrRequest, StatFsSnapshot};
 use dashmap::{DashMap, Entry};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -539,6 +539,223 @@ where
             }
         }
         Ok(cur_ino)
+    }
+
+    /// Recursively create directories (mkdir -p behavior) with structured errors.
+    pub async fn mkdir_p_err(&self, path: &str) -> Result<i64, VfsError> {
+        let path = Self::norm_path(path);
+        if path == "/" {
+            return Ok(self.core.root);
+        }
+
+        if let Some((ino, kind)) = self
+            .core
+            .meta_layer
+            .lookup_path(&path)
+            .await
+            .map_err(|e| VfsError::from_meta(path.clone(), e))?
+        {
+            if kind != FileType::Dir {
+                return Err(VfsError::NotADirectory {
+                    path: path.clone().into(),
+                });
+            }
+            return Ok(ino);
+        }
+
+        let mut cur_ino = self.core.root;
+        let mut cur_path = String::new();
+        for part in path.trim_start_matches('/').split('/') {
+            if part.is_empty() {
+                continue;
+            }
+            cur_path.push('/');
+            cur_path.push_str(part);
+
+            match self
+                .core
+                .meta_layer
+                .lookup(cur_ino, part)
+                .await
+                .map_err(|e| VfsError::from_meta(cur_path.clone(), e))?
+            {
+                Some(ino) => {
+                    let attr = self
+                        .core
+                        .meta_layer
+                        .stat(ino)
+                        .await
+                        .map_err(|e| VfsError::from_meta(cur_path.clone(), e))?
+                        .ok_or_else(|| VfsError::NotFound {
+                            path: cur_path.clone().into(),
+                        })?;
+                    if attr.kind != FileType::Dir {
+                        return Err(VfsError::NotADirectory {
+                            path: cur_path.clone().into(),
+                        });
+                    }
+                    cur_ino = ino;
+                }
+                None => {
+                    let ino = self
+                        .core
+                        .meta_layer
+                        .mkdir(cur_ino, part.to_string())
+                        .await
+                        .map_err(|e| VfsError::from_meta(cur_path.clone(), e))?;
+                    self.state.modified.touch(cur_ino).await;
+                    self.state.modified.touch(ino).await;
+                    cur_ino = ino;
+                }
+            }
+        }
+        Ok(cur_ino)
+    }
+
+    /// Create a single directory (non-recursive).
+    ///
+    /// - Parent directory must exist.
+    /// - If the target already exists as a directory, returns its inode.
+    /// - If the target exists as a file, returns `NotADirectory`.
+    /// - If parent does not exist, returns `NotFound`.
+    pub async fn mkdir_err(&self, path: &str) -> Result<i64, VfsError> {
+        let path = Self::norm_path(path);
+        if path == "/" {
+            return Ok(self.core.root);
+        }
+
+        let (dir, name) = Self::split_dir_file(&path);
+        if name.is_empty() {
+            return Err(VfsError::InvalidFilename);
+        }
+
+        // Check if parent exists
+        let parent_ino = if dir == "/" {
+            self.core.root
+        } else {
+            match self
+                .core
+                .meta_layer
+                .lookup_path(&dir)
+                .await
+                .map_err(|e| VfsError::from_meta(dir.clone(), e))?
+            {
+                Some((ino, kind)) => {
+                    if kind != FileType::Dir {
+                        return Err(VfsError::NotADirectory { path: dir.into() });
+                    }
+                    ino
+                }
+                None => return Err(VfsError::NotFound { path: dir.into() }),
+            }
+        };
+
+        // Check if target already exists
+        if let Some(ino) = self
+            .core
+            .meta_layer
+            .lookup(parent_ino, &name)
+            .await
+            .map_err(|e| VfsError::from_meta(path.clone(), e))?
+        {
+            let attr = self
+                .core
+                .meta_layer
+                .stat(ino)
+                .await
+                .map_err(|e| VfsError::from_meta(path.clone(), e))?
+                .ok_or_else(|| VfsError::NotFound {
+                    path: path.clone().into(),
+                })?;
+            if attr.kind == FileType::Dir {
+                return Ok(ino);
+            } else {
+                return Err(VfsError::AlreadyExists { path: path.into() });
+            }
+        }
+
+        // Create the directory
+        let ino = self
+            .core
+            .meta_layer
+            .mkdir(parent_ino, name.to_string())
+            .await
+            .map_err(|e| VfsError::from_meta(path.clone(), e))?;
+        Ok(ino)
+    }
+
+    /// Create a regular file in an existing parent directory (std-like behavior).
+    ///
+    /// - Does not create parent directories.
+    /// - If the target exists and `create_new` is true, returns `AlreadyExists`.
+    /// - If the target exists as a directory, returns `IsADirectory`.
+    pub async fn create_file_in_existing_dir_err(
+        &self,
+        path: &str,
+        create_new: bool,
+    ) -> Result<i64, VfsError> {
+        let path = Self::norm_path(path);
+        if path == "/" {
+            return Err(VfsError::IsADirectory { path: path.into() });
+        }
+
+        let (dir, name) = Self::split_dir_file(&path);
+        if name.is_empty() {
+            return Err(VfsError::InvalidFilename);
+        }
+
+        let parent_ino = if dir == "/" {
+            self.core.root
+        } else {
+            let (ino, kind) = self
+                .core
+                .meta_layer
+                .lookup_path(&dir)
+                .await
+                .map_err(|e| VfsError::from_meta(dir.clone(), e))?
+                .ok_or_else(|| VfsError::NotFound {
+                    path: dir.clone().into(),
+                })?;
+            if kind != FileType::Dir {
+                return Err(VfsError::NotADirectory { path: dir.into() });
+            }
+            ino
+        };
+
+        if let Some(existing) = self
+            .core
+            .meta_layer
+            .lookup(parent_ino, &name)
+            .await
+            .map_err(|e| VfsError::from_meta(path.clone(), e))?
+        {
+            let attr = self
+                .core
+                .meta_layer
+                .stat(existing)
+                .await
+                .map_err(|e| VfsError::from_meta(path.clone(), e))?
+                .ok_or_else(|| VfsError::NotFound {
+                    path: path.clone().into(),
+                })?;
+            if attr.kind == FileType::Dir {
+                return Err(VfsError::IsADirectory { path: path.into() });
+            }
+            if create_new {
+                return Err(VfsError::AlreadyExists { path: path.into() });
+            }
+            return Ok(existing);
+        }
+
+        let ino = self
+            .core
+            .meta_layer
+            .create_file(parent_ino, name)
+            .await
+            .map_err(|e| VfsError::from_meta(path.clone(), e))?;
+        self.state.modified.touch(parent_ino).await;
+        self.state.modified.touch(ino).await;
+        Ok(ino)
     }
 
     /// Create a regular file (running `mkdir_p` on its parent if needed).
@@ -2006,8 +2223,14 @@ where
         Ok(())
     }
 
-    async fn ensure_inode_registered(&self, ino: i64) -> Result<Arc<Inode>, VfsError> {
-        if let Some(inode) = self.state.inodes.get(&ino) {
+    /// Get file system statistics (total/available space and inodes).
+    pub async fn stat_fs(&self) -> Result<StatFsSnapshot, MetaError> {
+        self.core.meta_layer.stat_fs().await
+    }
+
+    async fn ensure_inode_registered(&self, ino: i64) -> Result<Arc<Inode>, String> {
+        // fast path to check whether there is an existing inode.
+        if let Some(inode) = self.state.files.inode(ino) {
             return Ok(inode.clone());
         }
 
