@@ -195,7 +195,7 @@ impl<S: BlockStore, M: MetaStore + 'static> Client<S, M> {
         self.fs
             .set_attr(attr.ino, req, flags)
             .await
-            .map_err(|e| io::Error::other(e.to_string()))
+            .map_err(io::Error::other)
     }
 
     /// Get file attributes without following symlinks.
@@ -238,10 +238,7 @@ impl<S: BlockStore, M: MetaStore + 'static> Client<S, M> {
 
     /// Get file system statistics (total/available space and inodes).
     pub async fn stat_fs_io(&self) -> io::Result<StatFsSnapshot> {
-        self.fs
-            .stat_fs()
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))
+        self.fs.stat_fs().await.map_err(io::Error::other)
     }
 
     /// Symlink support check for lstat.
