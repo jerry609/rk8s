@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
-use crate::vfs::fs::{DirEntry as VfsDirEntry, FileAttr as VfsFileAttr, FileType as VfsFileType};
+use crate::meta::store::{DirEntry as MetaDirEntry, FileAttr as MetaFileAttr, FileType as MetaFileType};
 
 // Re-export useful types from meta store
 pub use crate::meta::store::{SetAttrFlags, SetAttrRequest, StatFsSnapshot};
@@ -33,10 +33,10 @@ pub trait SdkClient: Send + Sync + 'static {
     async fn read_at(&self, path: &str, offset: u64, len: usize) -> io::Result<Vec<u8>>;
 
     /// Read directory entries.
-    async fn readdir(&self, path: &str) -> io::Result<Vec<VfsDirEntry>>;
+    async fn readdir(&self, path: &str) -> io::Result<Vec<MetaDirEntry>>;
 
     /// Get file/directory attributes.
-    async fn stat(&self, path: &str) -> io::Result<VfsFileAttr>;
+    async fn stat(&self, path: &str) -> io::Result<MetaFileAttr>;
 
     /// Remove a file.
     async fn unlink(&self, path: &str) -> io::Result<()>;
@@ -59,10 +59,10 @@ pub trait SdkClient: Send + Sync + 'static {
         path: &str,
         req: &SetAttrRequest,
         flags: SetAttrFlags,
-    ) -> io::Result<VfsFileAttr>;
+    ) -> io::Result<MetaFileAttr>;
 
     /// Get file attributes without following symlinks.
-    async fn lstat(&self, path: &str) -> io::Result<VfsFileAttr>;
+    async fn lstat(&self, path: &str) -> io::Result<MetaFileAttr>;
 
     /// Remove a directory and all its contents recursively.
     async fn remove_dir_all(&self, path: &str) -> io::Result<()>;
@@ -71,10 +71,10 @@ pub trait SdkClient: Send + Sync + 'static {
     async fn stat_fs(&self) -> io::Result<StatFsSnapshot>;
 
     /// Create a hard link.
-    async fn link(&self, existing: &str, link_path: &str) -> io::Result<VfsFileAttr>;
+    async fn link(&self, existing: &str, link_path: &str) -> io::Result<MetaFileAttr>;
 
     /// Create a symbolic link.
-    async fn symlink(&self, link_path: &str, target: &str) -> io::Result<VfsFileAttr>;
+    async fn symlink(&self, link_path: &str, target: &str) -> io::Result<MetaFileAttr>;
 
     /// Read the target of a symbolic link.
     async fn readlink(&self, path: &str) -> io::Result<String>;
@@ -108,11 +108,11 @@ where
         self.read_at_io(path, offset, len).await
     }
 
-    async fn readdir(&self, path: &str) -> io::Result<Vec<VfsDirEntry>> {
+    async fn readdir(&self, path: &str) -> io::Result<Vec<MetaDirEntry>> {
         self.readdir_io(path).await
     }
 
-    async fn stat(&self, path: &str) -> io::Result<VfsFileAttr> {
+    async fn stat(&self, path: &str) -> io::Result<MetaFileAttr> {
         self.stat_io(path).await
     }
 
@@ -141,11 +141,11 @@ where
         path: &str,
         req: &SetAttrRequest,
         flags: SetAttrFlags,
-    ) -> io::Result<VfsFileAttr> {
+    ) -> io::Result<MetaFileAttr> {
         self.set_attr_io(path, req, flags).await
     }
 
-    async fn lstat(&self, path: &str) -> io::Result<VfsFileAttr> {
+    async fn lstat(&self, path: &str) -> io::Result<MetaFileAttr> {
         self.lstat_io(path).await
     }
 
@@ -157,11 +157,11 @@ where
         self.stat_fs_io().await
     }
 
-    async fn link(&self, existing: &str, link_path: &str) -> io::Result<VfsFileAttr> {
+    async fn link(&self, existing: &str, link_path: &str) -> io::Result<MetaFileAttr> {
         self.link_io(existing, link_path).await
     }
 
-    async fn symlink(&self, link_path: &str, target: &str) -> io::Result<VfsFileAttr> {
+    async fn symlink(&self, link_path: &str, target: &str) -> io::Result<MetaFileAttr> {
         self.symlink_io(link_path, target).await
     }
 
@@ -187,25 +187,25 @@ fn path_to_str(path: impl AsRef<Path>) -> io::Result<String> {
 }
 
 #[derive(Debug, Clone)]
-pub struct FileType(VfsFileType);
+pub struct FileType(MetaFileType);
 
 impl FileType {
     pub fn is_file(&self) -> bool {
-        self.0 == VfsFileType::File
+        self.0 == MetaFileType::File
     }
 
     pub fn is_dir(&self) -> bool {
-        self.0 == VfsFileType::Dir
+        self.0 == MetaFileType::Dir
     }
 
     pub fn is_symlink(&self) -> bool {
-        self.0 == VfsFileType::Symlink
+        self.0 == MetaFileType::Symlink
     }
 }
 
 /// Metadata information about a file or directory.
 #[derive(Debug, Clone)]
-pub struct Metadata(VfsFileAttr);
+pub struct Metadata(MetaFileAttr);
 
 impl Metadata {
     /// Returns the size of the file in bytes.
@@ -225,17 +225,17 @@ impl Metadata {
 
     /// Returns true if this is a regular file.
     pub fn is_file(&self) -> bool {
-        self.0.kind == VfsFileType::File
+        self.0.kind == MetaFileType::File
     }
 
     /// Returns true if this is a directory.
     pub fn is_dir(&self) -> bool {
-        self.0.kind == VfsFileType::Dir
+        self.0.kind == MetaFileType::Dir
     }
 
     /// Returns true if this is a symbolic link.
     pub fn is_symlink(&self) -> bool {
-        self.0.kind == VfsFileType::Symlink
+        self.0.kind == MetaFileType::Symlink
     }
 
     /// Returns the file mode (permissions).
@@ -390,7 +390,7 @@ impl OpenOptions {
         self.validate()?;
         let path = path_to_str(path)?;
 
-        let mut pre_stat: Option<VfsFileAttr> = None;
+        let mut pre_stat: Option<MetaFileAttr> = None;
         if self.create_new {
             client.create_file(&path, true).await?;
         } else if self.create {
@@ -401,7 +401,7 @@ impl OpenOptions {
 
         if self.truncate {
             if let Some(meta) = pre_stat.as_ref()
-                && meta.kind == VfsFileType::Dir
+                && meta.kind == MetaFileType::Dir
             {
                 return Err(io::Error::new(io::ErrorKind::IsADirectory, path));
             }
@@ -412,7 +412,7 @@ impl OpenOptions {
             (Some(meta), false) => meta,
             _ => client.stat(&path).await?,
         };
-        if meta.kind == VfsFileType::Dir {
+        if meta.kind == MetaFileType::Dir {
             return Err(io::Error::new(io::ErrorKind::IsADirectory, path));
         }
 
@@ -714,7 +714,7 @@ pub async fn write(
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     parent: String,
-    inner: VfsDirEntry,
+    inner: MetaDirEntry,
 }
 
 impl DirEntry {
@@ -738,7 +738,7 @@ impl DirEntry {
 pub struct ReadDir {
     client: DynClient,
     parent: String,
-    entries: VecDeque<VfsDirEntry>,
+    entries: VecDeque<MetaDirEntry>,
 }
 
 impl ReadDir {

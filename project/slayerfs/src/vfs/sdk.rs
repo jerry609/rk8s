@@ -2,123 +2,114 @@
 //!
 //! Goals:
 //! - Path-level APIs: mkdir_p/create/read/write/readdir/stat
-//! - Pluggable backend: reuse Fs-level BlockStore and metadata layer
+//! - Pluggable backend: reuse Fs-level BlockStore and MetaStore
 //! - Provide a convenient LocalFs constructor
 
 use crate::chuck::chunk::ChunkLayout;
 use crate::chuck::store::BlockStore;
-use crate::meta::MetaLayer;
-use crate::meta::client::MetaClient;
+use crate::fs::{FileSystem, FileSystemConfig, OpenFlags};
 use crate::meta::factory::create_meta_store_from_url;
 use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
-use crate::meta::store::{MetaError, SetAttrFlags, SetAttrRequest, StatFsSnapshot};
-use crate::vfs::error::{PathHint, VfsError};
-use crate::vfs::fs::{DirEntry, FileAttr, FileType, VFS};
+use crate::meta::store::{DirEntry, FileAttr, FileType, MetaError, SetAttrFlags, SetAttrRequest, StatFsSnapshot};
+use crate::meta::MetaStore;
+use crate::vfs::error::VfsError;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
 
 /// SDK client parametrized by its backend.
-pub struct Client<S: BlockStore + Send + Sync + 'static, M: MetaLayer + Send + Sync + 'static> {
-    fs: VFS<S, M>,
+pub struct Client<S: BlockStore + Send + Sync + 'static, M: MetaStore + 'static> {
+    fs: FileSystem<S, M>,
 }
 
 #[allow(unused)]
-impl<S: BlockStore + Send + Sync + 'static, M: MetaLayer + Send + Sync + 'static> Client<S, M> {
-    pub async fn new(layout: ChunkLayout, store: S, meta_layer: Arc<M>) -> Result<Self, VfsError> {
-        let fs = VFS::with_meta_layer(layout, store, meta_layer)?;
+impl<S: BlockStore + Send + Sync + 'static, M: MetaStore + 'static> Client<S, M> {
+    pub async fn new(layout: ChunkLayout, store: S, meta: M) -> Result<Self, String> {
+        let fs = FileSystem::new(layout, store, meta).await?;
         Ok(Self { fs })
     }
 
-    pub fn from_vfs(fs: VFS<S, M>) -> Self {
+    pub fn from_filesystem(fs: FileSystem<S, M>) -> Self {
         Self { fs }
     }
 
-    pub async fn mkdir_p(&self, path: &str) -> Result<(), VfsError> {
-        let _ = self.fs.mkdir_p(path).await?;
+    pub async fn mkdir_p(&self, path: &str) -> Result<(), String> {
+        self.fs.mkdir_all(path).await.map_err(|e| e.to_string())
+    }
+
+    pub async fn create(&self, path: &str) -> Result<(), String> {
+        let _ = self.fs.create_file(path).await.map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    pub async fn create(&self, path: &str) -> Result<(), VfsError> {
-        let _ = self.fs.create_file(path).await?;
-        Ok(())
+    pub async fn write_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<usize, String> {
+        self.fs
+            .write_at(path, offset, data)
+            .await
+            .map_err(|e| e.to_string())
     }
 
-    pub async fn write_at(
-        &mut self,
-        path: &str,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<usize, VfsError> {
-        let attr = self.fs.stat(path).await?;
-        let fh = self.fs.open(attr.ino, attr, false, true).await?;
-        let result = self.fs.write(fh, offset, data).await;
-        let _ = self.fs.close(fh).await;
-        result
+    pub async fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, String> {
+        self.fs
+            .read_at(path, offset, len)
+            .await
+            .map_err(|e| e.to_string())
     }
 
-    pub async fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, VfsError> {
-        let attr = self.fs.stat(path).await?;
-        let fh = self.fs.open(attr.ino, attr, true, false).await?;
-        let result = self.fs.read(fh, offset, len).await;
-        let _ = self.fs.close(fh).await;
-        result
+    pub async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, String> {
+        self.fs.readdir(path).await.map_err(|e| e.to_string())
     }
 
-    pub async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, VfsError> {
-        let attr = self.fs.stat(path).await?;
-        if attr.kind != FileType::Dir {
-            return Err(VfsError::NotADirectory {
-                path: PathHint::some(path),
-            });
-        }
-        let fh = self.fs.opendir(attr.ino).await?;
-        let mut offset = 0u64;
-        let mut entries = Vec::new();
-        loop {
-            let batch = self.fs.readdir(fh, offset).unwrap_or_default();
-            if batch.is_empty() {
-                break;
-            }
-            offset += batch.len() as u64;
-            entries.extend(batch);
-        }
-        let _ = self.fs.closedir(fh);
-        Ok(entries)
-    }
-
-    pub async fn stat(&self, path: &str) -> Result<FileAttr, VfsError> {
-        self.fs.stat(path).await
+    pub async fn stat(&self, path: &str) -> Result<FileAttr, String> {
+        self.fs
+            .stat(path)
+            .await
+            .map(|fi| fi.attr().clone())
+            .map_err(|e| e.to_string())
     }
 
     pub async fn link(&self, existing: &str, link_path: &str) -> Result<FileAttr, VfsError> {
-        self.fs.link(existing, link_path).await
+        self.fs
+            .link(existing, link_path)
+            .await
+            .map_err(VfsError::from)?;
+        self.fs
+            .stat(link_path)
+            .await
+            .map(|fi| fi.attr().clone())
+            .map_err(VfsError::from)
     }
 
-    pub async fn symlink(&self, link_path: &str, target: &str) -> Result<FileAttr, VfsError> {
-        let (_, attr) = self.fs.create_symlink(link_path, target).await?;
-        Ok(attr)
+    pub async fn symlink(&self, link_path: &str, target: &str) -> Result<FileAttr, String> {
+        self.fs
+            .symlink(link_path, target)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.fs
+            .lstat(link_path)
+            .await
+            .map(|fi| fi.attr().clone())
+            .map_err(|e| e.to_string())
     }
 
-    pub async fn readlink(&self, path: &str) -> Result<String, VfsError> {
-        self.fs.readlink(path).await
+    pub async fn readlink(&self, path: &str) -> Result<String, String> {
+        self.fs.readlink(path).await.map_err(|e| e.to_string())
     }
 
     // Extra helpers: delete / rename / truncate
-    pub async fn unlink(&self, path: &str) -> Result<(), VfsError> {
-        self.fs.unlink(path).await
+    pub async fn unlink(&self, path: &str) -> Result<(), String> {
+        self.fs.unlink(path).await.map_err(|e| e.to_string())
     }
 
-    pub async fn rmdir(&self, path: &str) -> Result<(), VfsError> {
-        self.fs.rmdir(path).await
+    pub async fn rmdir(&self, path: &str) -> Result<(), String> {
+        self.fs.rmdir(path).await.map_err(|e| e.to_string())
     }
 
     pub async fn rename(&self, old: &str, new: &str) -> Result<(), VfsError> {
-        self.fs.rename(old, new).await
+        self.fs.rename(old, new).await.map_err(VfsError::from)
     }
 
-    pub async fn truncate(&self, path: &str, size: u64) -> Result<(), VfsError> {
-        self.fs.truncate(path, size).await
+    pub async fn truncate(&self, path: &str, size: u64) -> Result<(), String> {
+        self.fs.truncate(path, size).await.map_err(|e| e.to_string())
     }
 
     /// Get file lock information for a given path and query.
@@ -126,8 +117,8 @@ impl<S: BlockStore + Send + Sync + 'static, M: MetaLayer + Send + Sync + 'static
         &self,
         path: &str,
         query: &FileLockQuery,
-    ) -> Result<FileLockInfo, VfsError> {
-        self.fs.get_plock(path, query).await
+    ) -> Result<FileLockInfo, String> {
+        self.fs.get_plock(path, query).await.map_err(|e| e.to_string())
     }
 
     /// Set file lock for a given path.
@@ -143,71 +134,60 @@ impl<S: BlockStore + Send + Sync + 'static, M: MetaLayer + Send + Sync + 'static
         self.fs
             .set_plock(path, owner, block, lock_type, range, pid)
             .await
+            .map_err(VfsError::from)
     }
 
     // ===== Structured (std::io) variants for std-like SDK =====
 
     pub async fn mkdir_p_io(&self, path: &str) -> io::Result<()> {
-        self.fs
-            .mkdir_p_err(path)
-            .await
-            .map(|_| ())
-            .map_err(Into::into)
+        self.fs.mkdir_all(path).await
     }
 
     /// Create a single directory (non-recursive).
     pub async fn mkdir_io(&self, path: &str) -> io::Result<()> {
-        self.fs
-            .mkdir_err(path)
-            .await
-            .map(|_| ())
-            .map_err(Into::into)
+        self.fs.mkdir(path).await
     }
 
     pub async fn create_file_io(&self, path: &str, create_new: bool) -> io::Result<()> {
-        self.fs
-            .create_file_in_existing_dir_err(path, create_new)
-            .await
-            .map(|_| ())
-            .map_err(Into::into)
+        let flags = if create_new {
+            OpenFlags::create_new()
+        } else {
+            OpenFlags::create_write()
+        };
+        let _ = self.fs.open(path, flags).await?;
+        Ok(())
     }
 
     pub async fn write_at_io(&self, path: &str, offset: u64, data: &[u8]) -> io::Result<usize> {
-        self.fs
-            .write_err(path, offset, data)
-            .await
-            .map_err(Into::into)
+        self.fs.write_at(path, offset, data).await
     }
 
     pub async fn read_at_io(&self, path: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        self.fs
-            .read_err(path, offset, len)
-            .await
-            .map_err(Into::into)
+        self.fs.read_at(path, offset, len).await
     }
 
     pub async fn readdir_io(&self, path: &str) -> io::Result<Vec<DirEntry>> {
-        self.fs.readdir_err(path).await.map_err(Into::into)
+        self.fs.readdir(path).await
     }
 
     pub async fn stat_io(&self, path: &str) -> io::Result<FileAttr> {
-        self.fs.stat_err(path).await.map_err(Into::into)
+        self.fs.stat(path).await.map(|fi| fi.attr().clone())
     }
 
     pub async fn unlink_io(&self, path: &str) -> io::Result<()> {
-        self.fs.unlink_err(path).await.map_err(Into::into)
+        self.fs.unlink(path).await
     }
 
     pub async fn rmdir_io(&self, path: &str) -> io::Result<()> {
-        self.fs.rmdir_err(path).await.map_err(Into::into)
+        self.fs.rmdir(path).await
     }
 
     pub async fn rename_io(&self, old: &str, new: &str) -> io::Result<()> {
-        self.fs.rename_err(old, new).await.map_err(Into::into)
+        self.fs.rename(old, new).await
     }
 
     pub async fn truncate_io(&self, path: &str, size: u64) -> io::Result<()> {
-        self.fs.truncate_err(path, size).await.map_err(Into::into)
+        self.fs.truncate(path, size).await
     }
 
     /// Check whether a path exists.
@@ -222,18 +202,12 @@ impl<S: BlockStore + Send + Sync + 'static, M: MetaLayer + Send + Sync + 'static
         req: &SetAttrRequest,
         flags: SetAttrFlags,
     ) -> io::Result<FileAttr> {
-        let attr = self.fs.stat_err(path).await?;
-        self.fs
-            .set_attr(attr.ino, req, flags)
-            .await
-            .map_err(io::Error::other)
+        self.fs.set_attr(path, req, flags).await
     }
 
     /// Get file attributes without following symlinks.
     pub async fn lstat_io(&self, path: &str) -> io::Result<FileAttr> {
-        // For now, we use the same implementation as stat since VFS doesn't distinguish.
-        // TODO: Implement proper lstat that doesn't follow symlinks.
-        self.fs.stat_err(path).await.map_err(Into::into)
+        self.fs.lstat(path).await.map(|fi| fi.attr().clone())
     }
 
     /// Recursively remove a directory and all its contents.
@@ -248,7 +222,7 @@ impl<S: BlockStore + Send + Sync + 'static, M: MetaLayer + Send + Sync + 'static
     }
 
     async fn remove_dir_all_recursive(&self, path: &str) -> io::Result<()> {
-        let entries = self.fs.readdir_err(path).await?;
+        let entries = self.fs.readdir(path).await?;
         for entry in entries {
             let child_path = if path == "/" {
                 format!("/{}", entry.name)
@@ -260,38 +234,39 @@ impl<S: BlockStore + Send + Sync + 'static, M: MetaLayer + Send + Sync + 'static
                     Box::pin(self.remove_dir_all_recursive(&child_path)).await?;
                 }
                 _ => {
-                    self.fs.unlink_err(&child_path).await?;
+                    self.fs.unlink(&child_path).await?;
                 }
             }
         }
-        self.fs.rmdir_err(path).await.map_err(Into::into)
+        self.fs.rmdir(path).await
     }
 
     /// Get file system statistics (total/available space and inodes).
     pub async fn stat_fs_io(&self) -> io::Result<StatFsSnapshot> {
-        self.fs.stat_fs().await.map_err(io::Error::other)
+        let snapshot = self.fs.stat_fs().await?;
+        Ok(StatFsSnapshot {
+            total_space: snapshot.total_space,
+            available_space: snapshot.avail_space,
+            used_inodes: snapshot.used_inodes,
+            available_inodes: snapshot.avail_inodes,
+        })
     }
 
     /// Symlink support check for lstat.
     pub async fn readlink_io(&self, path: &str) -> io::Result<String> {
-        self.fs.readlink(path).await.map_err(io::Error::other)
+        self.fs.readlink(path).await
     }
 
     /// Create a hard link.
     pub async fn link_io(&self, existing: &str, link_path: &str) -> io::Result<FileAttr> {
-        self.fs
-            .link(existing, link_path)
-            .await
-            .map_err(io::Error::other)
+        self.fs.link(existing, link_path).await?;
+        self.fs.stat(link_path).await.map(|fi| fi.attr().clone())
     }
 
     /// Create a symbolic link.
     pub async fn symlink_io(&self, link_path: &str, target: &str) -> io::Result<FileAttr> {
-        self.fs
-            .create_symlink(link_path, target)
-            .await
-            .map(|(_, attr)| attr)
-            .map_err(io::Error::other)
+        self.fs.symlink(link_path, target).await?;
+        self.fs.lstat(link_path).await.map(|fi| fi.attr().clone())
     }
 }
 
@@ -300,10 +275,10 @@ impl<S: BlockStore + Send + Sync + 'static, M: MetaLayer + Send + Sync + 'static
 use crate::cadapter::client::ObjectClient;
 use crate::cadapter::localfs::LocalFsBackend;
 use crate::chuck::store::ObjectBlockStore;
-use crate::meta::stores::database_store::DatabaseMetaStore;
+use std::sync::Arc;
 
 #[allow(dead_code)]
-pub type LocalClient = Client<ObjectBlockStore<LocalFsBackend>, MetaClient<DatabaseMetaStore>>;
+pub type LocalClient = Client<ObjectBlockStore<LocalFsBackend>, Arc<dyn MetaStore>>;
 
 #[allow(dead_code)]
 impl LocalClient {
@@ -311,9 +286,27 @@ impl LocalClient {
     pub async fn new_local<P: AsRef<Path>>(root: P, layout: ChunkLayout) -> Result<Self, VfsError> {
         let client = ObjectClient::new(LocalFsBackend::new(root));
         let meta_handle = create_meta_store_from_url("sqlite::memory:").await?;
-        let metadata = meta_handle.layer();
+        let metadata: Arc<dyn MetaStore> = meta_handle.store();
         let store = ObjectBlockStore::new(client);
-        let fs = VFS::with_meta_layer(layout, store, metadata)?;
+        let fs = FileSystem::new(layout, store, metadata)
+            .await
+            .map_err(MetaError::Internal)?;
+        Ok(Client { fs })
+    }
+
+    #[allow(dead_code)]
+    pub async fn new_local_with_config<P: AsRef<Path>>(
+        root: P,
+        layout: ChunkLayout,
+        config: FileSystemConfig,
+    ) -> Result<Self, MetaError> {
+        let client = ObjectClient::new(LocalFsBackend::new(root));
+        let meta_handle = create_meta_store_from_url("sqlite::memory:").await?;
+        let metadata: Arc<dyn MetaStore> = meta_handle.store();
+        let store = ObjectBlockStore::new(client);
+        let fs = FileSystem::with_config(layout, store, metadata, config)
+            .await
+            .map_err(MetaError::Internal)?;
         Ok(Client { fs })
     }
 }
@@ -321,6 +314,7 @@ impl LocalClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::CallerIdentity;
     use crate::vfs::fs::FileType;
     use tempfile::tempdir;
 
@@ -328,7 +322,8 @@ mod tests {
     async fn test_sdk_local_basic() {
         let layout = ChunkLayout::default();
         let tmp = tempdir().unwrap();
-        let mut cli = LocalClient::new_local(tmp.path(), layout)
+        let config = FileSystemConfig::default().with_caller(CallerIdentity::root());
+        let cli = LocalClient::new_local_with_config(tmp.path(), layout, config)
             .await
             .expect("init LocalClient");
 
@@ -362,7 +357,8 @@ mod tests {
     async fn test_sdk_local_ops_extras() {
         let layout = ChunkLayout::default();
         let tmp = tempdir().unwrap();
-        let cli = LocalClient::new_local(tmp.path(), layout)
+        let config = FileSystemConfig::default().with_caller(CallerIdentity::root());
+        let cli = LocalClient::new_local_with_config(tmp.path(), layout, config)
             .await
             .expect("init LocalClient");
 
@@ -383,7 +379,8 @@ mod tests {
     async fn test_sdk_local_links() {
         let layout = ChunkLayout::default();
         let tmp = tempdir().unwrap();
-        let mut cli = LocalClient::new_local(tmp.path(), layout)
+        let config = FileSystemConfig::default().with_caller(CallerIdentity::root());
+        let cli = LocalClient::new_local_with_config(tmp.path(), layout, config)
             .await
             .expect("init LocalClient");
 

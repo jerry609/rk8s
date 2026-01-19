@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
+use crate::meta::client::MetaClientOptions;
 
 /// SlayerFS configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +132,33 @@ pub struct CacheConfig {
     /// Whether cache is enabled (default: true)
     #[serde(default = "default_cache_enabled")]
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetaClientConfig {
+    pub capacity: CacheCapacity,
+    pub ttl: CacheTtl,
+    pub options: MetaClientOptions,
+}
+
+impl Default for MetaClientConfig {
+    fn default() -> Self {
+        Self {
+            capacity: CacheCapacity::default(),
+            ttl: CacheTtl::default(),
+            options: MetaClientOptions::default(),
+        }
+    }
+}
+
+impl MetaClientConfig {
+    pub fn effective_ttl(&self) -> CacheTtl {
+        if self.ttl.is_zero() {
+            CacheTtl::for_sqlite()
+        } else {
+            self.ttl.clone()
+        }
+    }
 }
 
 /// Meta client behaviour configuration

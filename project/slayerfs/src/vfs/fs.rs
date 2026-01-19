@@ -2,9 +2,10 @@
 
 use crate::chuck::chunk::ChunkLayout;
 use crate::chuck::store::BlockStore;
+use crate::file_io::Inode;
 use crate::meta::MetaLayer;
 use crate::meta::client::{MetaClient, MetaClientOptions};
-use crate::meta::config::{CacheCapacity, CacheTtl};
+use crate::meta::config::{CacheCapacity, CacheTtl, MetaClientConfig};
 use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
 use crate::meta::store::{MetaError, MetaStore, SetAttrFlags, SetAttrRequest, StatFsSnapshot};
 use dashmap::{DashMap, Entry};
@@ -32,8 +33,6 @@ use crate::vfs::backend::Backend;
 use crate::vfs::config::VFSConfig;
 use crate::vfs::error::{PathHint, VfsError};
 use crate::vfs::handles::{DirHandle, FileHandle, HandleFlags};
-use crate::vfs::inode::Inode;
-use crate::vfs::io::{DataReader, DataWriter};
 
 struct HandleRegistry<B, M>
 where
@@ -244,23 +243,6 @@ where
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct MetaClientConfig {
-    pub(crate) capacity: CacheCapacity,
-    pub(crate) ttl: CacheTtl,
-    pub(crate) options: MetaClientOptions,
-}
-
-impl Default for MetaClientConfig {
-    fn default() -> Self {
-        Self {
-            capacity: CacheCapacity::default(),
-            ttl: CacheTtl::for_sqlite(),
-            options: MetaClientOptions::default(),
-        }
-    }
-}
-
 #[allow(unused)]
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Clone)]
@@ -291,11 +273,7 @@ where
         let store = Arc::new(store);
         let meta = Arc::new(meta);
 
-        let ttl = if config.ttl.is_zero() {
-            CacheTtl::for_sqlite()
-        } else {
-            config.ttl.clone()
-        };
+        let ttl = config.effective_ttl();
 
         let meta_client = MetaClient::with_options(
             Arc::clone(&meta),
@@ -987,6 +965,23 @@ where
                 path: PathHint::some(path.clone()),
             })?;
         Ok(meta_attr)
+    }
+
+    /// Fetch a file's attributes (kind/size come from the MetaStore), following symlinks.
+    pub async fn stat_follow_err(&self, path: &str) -> Result<FileAttr, VfsError> {
+        let path = Self::norm_path(path);
+        let ino = self
+            .core
+            .meta_layer
+            .resolve_path_follow(&path)
+            .await
+            .map_err(|e| VfsError::from_meta(path.clone(), e))?;
+        self.core
+            .meta_layer
+            .stat(ino)
+            .await
+            .map_err(|e| VfsError::from_meta(path.clone(), e))?
+            .ok_or(VfsError::NotFound { path })
     }
 
     /// Read a symlink target by inode.

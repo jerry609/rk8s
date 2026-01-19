@@ -7,29 +7,22 @@
 // - Writer commit will call DataReader::invalidate(...) to mark cached slices stale.
 
 use crate::chuck::reader::DataFetcher;
-use crate::chuck::{BlockStore, ChunkLayout};
+use crate::chuck::{BlockStore, ChunkLayout, ChunkSpan, ChunkTag};
+use crate::file_io::{Inode, chunk_id_for, split_chunk_spans};
 use crate::meta::MetaLayer;
 use crate::utils::Intervals;
 use crate::vfs::backend::Backend;
-use crate::vfs::chunk_id_for;
 use crate::vfs::config::ReadConfig;
-use crate::vfs::inode::Inode;
-use crate::vfs::io::split_chunk_spans;
 use dashmap::DashMap;
-use parking_lot::Mutex as ParkingMutex;
 use std::collections::{HashMap, VecDeque};
+use std::convert::TryFrom;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::{Mutex, Notify};
-use tokio::time::Instant;
-
-const MAX_WAIT: Duration = Duration::from_secs(30);
 
 #[allow(clippy::type_complexity)]
 pub(crate) struct DataReader<B, M> {
     config: Arc<ReadConfig>,
-    buffer_usage: Arc<AtomicU64>,
     // per-handle readers, grouped by inode
     files: DashMap<u64, Vec<(u64, Arc<FileReader<B, M>>)>>, // ino -> (fh, reader)
     backend: Arc<Backend<B, M>>,
@@ -43,7 +36,6 @@ where
     pub(crate) fn new(config: Arc<ReadConfig>, backend: Arc<Backend<B, M>>) -> Self {
         Self {
             config,
-            buffer_usage: Arc::new(AtomicU64::new(0)),
             files: DashMap::new(),
             backend,
         }
@@ -53,7 +45,6 @@ where
         let ino_number = ino.ino();
         let reader = Arc::new(FileReader::new(
             self.config.clone(),
-            self.buffer_usage.clone(),
             ino,
             self.backend.clone(),
         ));
@@ -86,113 +77,26 @@ where
         })
     }
 
-    fn collect_readers(&self, ino: u64) -> Vec<Arc<FileReader<B, M>>> {
-        match self.files.get(&ino) {
-            Some(entry) => entry.iter().map(|(_, reader)| reader.clone()).collect(),
-            None => vec![],
-        }
-    }
-
     pub(crate) async fn invalidate(&self, ino: u64, offset: u64, len: usize) -> anyhow::Result<()> {
-        for reader in self.collect_readers(ino) {
+        let readers = match self.files.get(&ino) {
+            Some(entry) => entry.iter().map(|(_, reader)| reader.clone()).collect(),
+            None => Vec::new(),
+        };
+
+        for reader in readers {
             reader.invalidate(offset, len).await;
         }
         Ok(())
     }
 
     pub(crate) async fn invalidate_all(&self, ino: u64) {
-        for reader in self.collect_readers(ino) {
+        let readers = match self.files.get(&ino) {
+            Some(entry) => entry.iter().map(|(_, reader)| reader.clone()).collect(),
+            None => Vec::new(),
+        };
+
+        for reader in readers {
             reader.invalidate_all().await;
-        }
-    }
-}
-
-/// A Session tracks the read pattern of a specific handle to guide slice eviction.
-///
-/// There are 4 fields:
-/// 1. `ahead`: possible readahead length.
-/// 2. `last_off`: the offset of the last read operation.
-/// 3. `total`: total read length of the session.
-/// 4. `atime`: the last time.
-///
-/// According to the Principle of Locality, when a range is read, its adjacent ranges are
-/// likely to be read soon. The session records the last read offset and predicts a readahead range.
-/// It uses this pattern to evaluate slice utility:
-/// slices outside the predicted range are treated as "useless" and will be cleaned to satisfy the buffer size limit.
-///
-/// A slice `[start, end]` is considered "useful" if it falls within the window:
-/// `[last_off - backward_tolerance, last_off + forward_prediction]`
-/// where:
-/// - `backward_tolerance = max(ahead / 8, block_size)`
-/// - `forward_prediction = 2 * ahead + 2 * block_size`
-///
-/// This windows reflects an aggressive forward readahead strategy while remaining tolerant of small backward seeks.
-///
-/// To adapt to larger sequential reads, the `ahead` length is doubled whenever the total read length reaches the current
-/// `ahead` threshold, effectively expanding the predictive window. In contract, it reduces by half to adapt smaller reads.
-///
-/// A handle generally maintains two independent Sessions to support concurrent read patterns.
-/// This is particularly beneficial for interleaved `pread` operations, as it allows the system to track
-/// two separate read streams simultaneously without their predictive windows interfering with each other.
-///
-/// If these two sessions are both available, it selects the oldest (atime).
-#[derive(Clone, Copy)]
-struct Session {
-    ahead: u64,
-    last_off: u64,
-    total: u64,
-    atime: Instant,
-}
-
-impl Default for Session {
-    fn default() -> Self {
-        Self {
-            ahead: 0,
-            last_off: 0,
-            total: 0,
-            atime: Instant::now(),
-        }
-    }
-}
-
-impl Session {
-    fn reset(&mut self, off: u64, _len: u64) {
-        self.last_off = off;
-        self.total = 0;
-        self.ahead = 0;
-        self.atime = Instant::now();
-    }
-
-    fn update(&mut self, off: u64, len: u64) {
-        let end = off + len;
-        if end > self.last_off {
-            self.total += end - self.last_off;
-            self.last_off = end;
-        }
-        self.atime = Instant::now();
-    }
-
-    fn window(&self, block_size: u64) -> (u64, u64) {
-        let back = (self.ahead / 8).max(block_size);
-
-        let win_start = self.last_off.saturating_sub(back);
-        let win_end = self
-            .last_off
-            .saturating_add(self.ahead.saturating_mul(2))
-            .saturating_add(block_size.saturating_mul(2));
-        (win_start, win_end)
-    }
-
-    fn update_ahead(&mut self, cfg: &ReadConfig) {
-        if self.ahead == 0 {
-            self.ahead = cfg.layout.block_size as u64;
-        } else if self.total >= self.ahead && self.ahead < cfg.max_ahead {
-            // Double the ahead to adapt larger read patterns.
-            self.ahead *= 2;
-        } else if self.total.saturating_mul(4) < self.ahead {
-            // Only shrink when the current sequential progress is much smaller than
-            // the prediction window.
-            self.ahead /= 2;
         }
     }
 }
@@ -227,7 +131,7 @@ struct SliceState {
 }
 
 impl SliceState {
-    fn new(index: u64, range: (u32, u32), refs: u16) -> Self {
+    fn new(index: u64, range: (u32, u32)) -> Self {
         Self {
             index,
             range,
@@ -236,15 +140,8 @@ impl SliceState {
             err: None,
             notify: Arc::new(Notify::new()),
             generation: 0,
-            refs,
+            refs: 0,
         }
-    }
-
-    fn in_flight(&self) -> bool {
-        matches!(
-            self.state,
-            SliceStatus::Refresh | SliceStatus::New | SliceStatus::Busy
-        )
     }
 
     fn overlaps(&self, offset: u32, len: u32) -> bool {
@@ -253,9 +150,8 @@ impl SliceState {
     }
 
     fn background_fetch<B, M>(
-        this: Arc<ParkingMutex<SliceState>>,
+        this: Arc<StdMutex<SliceState>>,
         ino: u64,
-        usage: Arc<AtomicU64>,
         layout: ChunkLayout,
         backend: Arc<Backend<B, M>>,
     ) where
@@ -264,7 +160,7 @@ impl SliceState {
     {
         tokio::spawn(async move {
             let (index, (start, end), generation) = {
-                let mut guard = this.lock();
+                let mut guard = this.lock().unwrap();
                 match guard.state {
                     SliceStatus::Busy | SliceStatus::Invalid => {
                         return;
@@ -286,7 +182,7 @@ impl SliceState {
             };
 
             let result = f().await;
-            let mut guard = this.lock();
+            let mut guard = this.lock().unwrap();
 
             // Stale fetch and needs to drop.
             if guard.generation != generation {
@@ -295,23 +191,12 @@ impl SliceState {
 
             match result {
                 Ok(out) => {
-                    let old_len = guard.page.len() as u64;
-                    let new_len = out.len() as u64;
-
-                    if new_len >= old_len {
-                        usage.fetch_add(new_len - old_len, Ordering::Relaxed);
-                    } else {
-                        sub_usage(&usage, old_len - new_len);
-                    }
-
                     guard.state = SliceStatus::Ready;
                     guard.page = out;
                     guard.err = None;
                 }
                 Err(e) => {
-                    sub_usage(&usage, guard.page.len() as u64);
                     guard.state = SliceStatus::Invalid;
-                    guard.page = Vec::new();
                     guard.err = Some(e.to_string());
                 }
             }
@@ -320,35 +205,31 @@ impl SliceState {
     }
 }
 
-struct SlicePinGuard {
-    slices: Vec<Arc<ParkingMutex<SliceState>>>,
+/// Slice Reference Guard
+struct SliceRef {
+    slice: Arc<StdMutex<SliceState>>,
 }
 
-impl SlicePinGuard {
-    pub fn new() -> Self {
-        Self { slices: Vec::new() }
-    }
-
-    pub fn add(&mut self, slice: Arc<ParkingMutex<SliceState>>) {
-        self.slices.push(slice);
+impl SliceRef {
+    fn new(slice: Arc<StdMutex<SliceState>>) -> Self {
+        let mut guard = slice.lock().unwrap();
+        guard.refs = guard.refs.saturating_add(1);
+        drop(guard);
+        Self { slice }
     }
 }
 
-impl Drop for SlicePinGuard {
+impl Drop for SliceRef {
     fn drop(&mut self) {
-        for slice in self.slices.drain(..) {
-            let mut guard = slice.lock();
-            guard.refs = guard.refs.saturating_sub(1);
-        }
+        let mut guard = self.slice.lock().unwrap();
+        guard.refs = guard.refs.saturating_sub(1);
     }
 }
 
 pub(crate) struct FileReader<B, M> {
     config: Arc<ReadConfig>,
-    buffer_usage: Arc<AtomicU64>,
     inode: Arc<Inode>,
-    slices: Mutex<VecDeque<Arc<ParkingMutex<SliceState>>>>,
-    sessions: ParkingMutex<[Session; 2]>,
+    slices: Mutex<VecDeque<Arc<StdMutex<SliceState>>>>,
     backend: Arc<Backend<B, M>>,
 }
 
@@ -359,16 +240,13 @@ where
 {
     pub(crate) fn new(
         config: Arc<ReadConfig>,
-        buffer_usage: Arc<AtomicU64>,
         inode: Arc<Inode>,
         backend: Arc<Backend<B, M>>,
     ) -> Self {
         Self {
             config,
             inode,
-            buffer_usage,
             slices: Mutex::new(VecDeque::new()),
-            sessions: ParkingMutex::new([Session::default(); 2]),
             backend,
         }
     }
@@ -383,167 +261,10 @@ where
         Ok(buf)
     }
 
-    fn select_forward_session_match(&self, sessions: &[Session; 2], offset: u64) -> Option<usize> {
-        let sat = |s: &Session, offset: u64| {
-            s.last_off <= offset
-                && offset <= s.last_off + s.ahead + self.config.layout.block_size as u64
-        };
-
-        let max_off = if sessions[0].last_off > sessions[1].last_off {
-            0
-        } else {
-            1
-        };
-
-        if sat(&sessions[max_off], offset) {
-            return Some(max_off);
-        }
-        if sat(&sessions[1 - max_off], offset) {
-            return Some(1 - max_off);
-        }
-        None
-    }
-
-    fn select_back_session_match(&self, sessions: &[Session; 2], offset: u64) -> Option<usize> {
-        let sat = |s: &Session, offset: u64| {
-            let back = (s.ahead / 8).max(self.config.layout.block_size as u64);
-            offset < s.last_off && offset >= s.last_off.saturating_sub(back)
-        };
-
-        let min_off = if sessions[0].last_off < sessions[1].last_off {
-            0
-        } else {
-            1
-        };
-
-        if sat(&sessions[min_off], offset) {
-            return Some(min_off);
-        }
-        if sat(&sessions[1 - min_off], offset) {
-            return Some(1 - min_off);
-        }
-        None
-    }
-
-    fn select_session_fallback(
-        &self,
-        sessions: &mut [Session; 2],
-        offset: u64,
-        len: usize,
-    ) -> usize {
-        if sessions[0].total == 0 {
-            return 0;
-        }
-        if sessions[1].total == 0 {
-            return 1;
-        }
-
-        let oldest_atime = if sessions[0].atime < sessions[1].atime {
-            0
-        } else {
-            1
-        };
-        sessions[oldest_atime].reset(offset, len as u64);
-        oldest_atime
-    }
-
-    fn check_session(&self, offset: u64, len: usize) {
-        let mut session = self.sessions.lock();
-
-        let selected = self
-            .select_forward_session_match(&session, offset)
-            .or_else(|| self.select_back_session_match(&session, offset))
-            .unwrap_or(self.select_session_fallback(&mut session, offset, len));
-        session[selected].update(offset, len as u64);
-        session[selected].update_ahead(&self.config);
-    }
-
-    async fn clean_evictable_slices(&self, offset: u64, len: usize) {
-        // Early exit if memory usage is acceptable
-        if self.buffer_usage.load(Ordering::Relaxed) <= self.config.buffer_size {
-            return;
-        }
-
-        let sessions = *self.sessions.lock();
-        let windows = sessions
-            .iter()
-            .filter(|s| s.total > 0)
-            .map(|s| s.window(self.config.layout.block_size as u64))
-            .collect::<Vec<_>>();
-
-        let cur_start = offset;
-        let cur_end = offset + len as u64;
-
-        let mut guard = self.slices.lock().await;
-        guard.retain(|slice| {
-            let slice = slice.lock();
-
-            if slice.refs > 0 || slice.in_flight() {
-                return true;
-            }
-
-            let base = slice.index * self.config.layout.chunk_size;
-            let slice_start = base + slice.range.0 as u64;
-            let slice_end = base + slice.range.1 as u64;
-
-            let overlaps_current = slice_start < cur_end && cur_start < slice_end;
-            let needed_by_session = windows
-                .iter()
-                .any(|(win_start, win_end)| slice_start < *win_end && *win_start < slice_end);
-            let need_retain = overlaps_current || needed_by_session;
-
-            if !need_retain {
-                sub_usage(&self.buffer_usage, slice.page.len() as u64);
-            }
-            need_retain
-        })
-    }
-
-    async fn back_pressure(&self) -> anyhow::Result<()> {
-        tracing::trace!(
-            "Memory usage: {}MiB",
-            self.buffer_usage.load(Ordering::Relaxed) / 1024 / 1024
-        );
-
-        let mut total_wait = Duration::ZERO;
-        let hard_limit = self.config.buffer_size * 2;
-        // buffer size limit is just a soft limit. It is perfectly normal to see that the current memory usage exceed it.
-        if self.buffer_usage.load(Ordering::Relaxed) > self.config.buffer_size {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-
-            // `2 * buffer size limit` is a hard limit. A read operation idle until memory pressure is relieved.
-            while self.buffer_usage.load(Ordering::Relaxed) > hard_limit {
-                if total_wait >= MAX_WAIT {
-                    return Err(anyhow::anyhow!(
-                        "Timeout waiting for buffer space after {:?}. Current usage: {} bytes, limit: {} bytes",
-                        total_wait,
-                        self.buffer_usage.load(Ordering::Relaxed),
-                        hard_limit,
-                    ));
-                }
-
-                tracing::warn!("Reach buffer size hard limit: sleep for 100 millis");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                total_wait += Duration::from_millis(100);
-            }
-        }
-        Ok(())
-    }
-
-    #[tracing::instrument(level = "trace", skip(self, buf), fields(offset, len = buf.len()))]
     pub(crate) async fn read_at(&self, offset: u64, buf: &mut [u8]) -> anyhow::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
-
-        // Lock the corresponding writer so a concurrent writer can't append a new slice while
-        // we are sampling chunk metadata. Without this guard, the per-chunk readers could see
-        // a stale slice set and end up reading the wrong data.
-        //
-        // This lock MUST be acquired before checking file_size to ensure we see a consistent
-        // view of the file. Otherwise, a concurrent write could be in progress but not yet
-        // reflected in the file size, causing us to return early with stale/empty data.
-        let writer_guard = self.writer.read().await;
 
         // Check file size and adjust read length if necessary
         let file_size = self.inode.file_size();
@@ -556,24 +277,20 @@ where
             return Ok(0);
         }
 
-        self.back_pressure().await?;
-        self.clean_evictable_slices(offset, actual_len).await;
-
-        // Pre-fill with zeros so holes or missing slices read as zeros.
-        buf[..actual_len].fill(0);
-
-        let spans = split_chunk_spans(self.config.layout, offset, actual_len);
-
-        let mut pin_guard = Vec::new();
-        for span in spans.iter().copied() {
-            // `prepare_slices` don't wait for all data is ready.
-            pin_guard.push(
-                self.prepare_slices(span.index, (span.offset, span.offset + span.len))
-                    .await,
-            );
+        let layout = self.config.layout;
+        let chunk_span = ChunkSpan::new(
+            layout.chunk_index_of(offset),
+            u32::try_from(layout.within_chunk_offset(offset))
+                .expect("chunk offset must fit within u32 for spans"),
+            u32::try_from(actual_len).expect("read length must fit within u32 for spans"),
+        );
+        let spans: Vec<ChunkSpan> = chunk_span
+            .split_into::<ChunkTag>(layout.chunk_size, layout.chunk_size, false)
+            .collect();
+        for span in spans.iter() {
+            let end = span.offset.saturating_add(span.len);
+            self.prepare_slices(span.index, (span.offset, end)).await;
         }
-
-        self.check_session(offset, actual_len);
 
         let mut tail = buf;
         let result = async {
@@ -586,23 +303,21 @@ where
         }
         .await;
 
-        drop(pin_guard);
-
         // Do a cleanup each read.
         self.cleanup_invalid().await;
         result
     }
 
-    async fn wait_ready(slice: &Arc<ParkingMutex<SliceState>>) -> anyhow::Result<()> {
+    async fn wait_ready(slice: &Arc<StdMutex<SliceState>>) -> anyhow::Result<()> {
         loop {
             let notify = {
-                let guard = slice.lock();
+                let guard = slice.lock().unwrap();
 
                 match guard.state {
                     SliceStatus::Ready => return Ok(()),
                     SliceStatus::Invalid => {
-                        let err = guard.err.as_deref().unwrap_or("slice invalid");
-                        return Err(anyhow::anyhow!("Slice fetch failed: {err}"));
+                        let err = guard.err.as_deref().unwrap_or("slice invalid").to_string();
+                        return Err(anyhow::anyhow!(err));
                     }
                     _ => guard.notify.clone(),
                 }
@@ -618,48 +333,39 @@ where
             let guard = self.slices.lock().await;
             guard
                 .iter()
-                .filter(|s| s.lock().index == index)
+                .filter(|s| s.lock().unwrap().index == index)
                 .cloned()
                 .collect::<Vec<_>>()
         };
 
         for slice in slices {
-            // There locks the slice twice, but it is still worth it
-            // as the parking_lot::Mutex is lightweight.
-            let (dst_start, dst_end) = {
-                let guard = slice.lock();
-                (
-                    offset.max(guard.range.0),
-                    guard.range.1.min(offset + buf.len() as u32),
-                )
-            };
-
-            if dst_start >= dst_end {
-                continue;
-            }
-
+            let _slice_ref = SliceRef::new(slice.clone());
             Self::wait_ready(&slice).await?;
 
-            let guard = slice.lock();
+            let guard = slice.lock().unwrap();
 
-            let dst_local_start = dst_start - offset;
-            let dst_local_end = dst_end - offset;
-            let src_start = dst_start - guard.range.0;
-            let src_end = dst_end - guard.range.0;
+            let dst_start = offset.max(guard.range.0);
+            let dst_end = guard.range.1.min(offset + buf.len() as u32);
 
-            buf[dst_local_start as usize..dst_local_end as usize]
-                .copy_from_slice(&guard.page[src_start as usize..src_end as usize]);
+            if dst_start < dst_end {
+                let dst_local_start = dst_start - offset;
+                let dst_local_end = dst_end - offset;
+                let src_start = dst_start - guard.range.0;
+                let src_end = dst_end - guard.range.0;
+
+                buf[dst_local_start as usize..dst_local_end as usize]
+                    .copy_from_slice(&guard.page[src_start as usize..src_end as usize]);
+            }
         }
         Ok(())
     }
 
-    async fn prepare_slices(&self, index: u64, (start, end): (u32, u32)) -> SlicePinGuard {
-        let mut pinned = SlicePinGuard::new();
+    async fn prepare_slices(&self, index: u64, (start, end): (u32, u32)) {
         let mut cutter = Intervals::new(start, end);
 
         let mut guard = self.slices.lock().await;
         for slice in guard.iter() {
-            let mut guard = slice.lock();
+            let guard = slice.lock().unwrap();
 
             if guard.index != index {
                 continue;
@@ -669,30 +375,20 @@ where
                 continue;
             }
 
-            // The "reservation" needs to read this slice.
-            if guard.overlaps(start, end.saturating_sub(start)) {
-                guard.refs = guard.refs.saturating_add(1);
-                pinned.add(slice.clone());
-            }
-
             let (l, r) = guard.range;
             cutter.cut(l, r);
         }
 
         for range in cutter.collect() {
-            let slice = Arc::new(ParkingMutex::new(SliceState::new(index, range, 1)));
+            let slice = Arc::new(StdMutex::new(SliceState::new(index, range)));
             SliceState::background_fetch(
                 slice.clone(),
                 self.inode.ino() as u64,
-                self.buffer_usage.clone(),
                 self.config.layout,
                 self.backend.clone(),
             );
-            pinned.add(slice.clone());
             guard.push_back(slice);
         }
-
-        pinned
     }
 
     async fn invalidate(&self, offset: u64, len: usize) {
@@ -712,9 +408,8 @@ where
 
         {
             let mut guard = self.slices.lock().await;
-            let mut freed = 0u64;
             for slice in guard.drain(..) {
-                let mut state = slice.lock();
+                let mut state = slice.lock().unwrap();
                 let Some((span_offset, span_len)) = span_map.get(&state.index) else {
                     new_slices.push_back(slice.clone());
                     continue;
@@ -745,12 +440,9 @@ where
 
                 if !matches!(state.state, SliceStatus::Invalid) || state.refs > 0 {
                     new_slices.push_back(slice.clone());
-                } else {
-                    freed += state.page.len() as u64;
                 }
             }
             *guard = new_slices;
-            sub_usage(&self.buffer_usage, freed);
         }
 
         // Invalidated slices must be re-fetched.
@@ -758,7 +450,6 @@ where
             SliceState::background_fetch(
                 slice,
                 self.inode.ino() as u64,
-                self.buffer_usage.clone(),
                 self.config.layout,
                 self.backend.clone(),
             );
@@ -767,33 +458,17 @@ where
 
     async fn invalidate_all(&self) {
         let mut guard = self.slices.lock().await;
-        let mut freed = 0u64;
-        for slice in guard.drain(..) {
-            let state = slice.lock();
-            freed += state.page.len() as u64;
-        }
-        sub_usage(&self.buffer_usage, freed);
+        guard.clear();
     }
 
     /// Clean all invalid and unused slices.
     async fn cleanup_invalid(&self) {
         let mut guard = self.slices.lock().await;
         guard.retain(|slice| {
-            let state = slice.lock();
-
-            let need_retain = !(matches!(state.state, SliceStatus::Invalid) && state.refs == 0);
-            if !need_retain {
-                sub_usage(&self.buffer_usage, state.page.len() as u64);
-            }
-            need_retain
+            let state = slice.lock().unwrap();
+            !(matches!(state.state, SliceStatus::Invalid) && state.refs == 0)
         });
     }
-}
-
-fn sub_usage(usage: &AtomicU64, delta: u64) {
-    let _ = usage.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |r| {
-        Some(r.saturating_sub(delta))
-    });
 }
 
 #[cfg(test)]
@@ -824,7 +499,7 @@ mod tests {
         let meta = create_meta_store_from_url("sqlite::memory:")
             .await
             .unwrap()
-            .layer();
+            .store();
         let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
 
         let ino: i64 = 11;
@@ -836,11 +511,7 @@ mod tests {
         let slice_id1 = meta.next_id(SLICE_ID_KEY).await.unwrap();
         let uploader = DataUploader::new(layout, chunk_id_for(ino, 0), backend.as_ref());
         let desc1 = uploader
-            .write_at_vectored(
-                slice_id1 as u64,
-                offset as u32,
-                &[bytes::Bytes::copy_from_slice(head)],
-            )
+            .write_at(slice_id1 as u64, offset as u32, head)
             .await
             .unwrap();
         meta.append_slice(chunk_id_for(ino, 0), desc1)
@@ -849,10 +520,7 @@ mod tests {
 
         let slice_id2 = meta.next_id(SLICE_ID_KEY).await.unwrap();
         let uploader = DataUploader::new(layout, chunk_id_for(ino, 1), backend.as_ref());
-        let desc2 = uploader
-            .write_at_vectored(slice_id2 as u64, 0, &[bytes::Bytes::copy_from_slice(tail)])
-            .await
-            .unwrap();
+        let desc2 = uploader.write_at(slice_id2 as u64, 0, tail).await.unwrap();
         meta.append_slice(chunk_id_for(ino, 1), desc2)
             .await
             .unwrap();
@@ -874,7 +542,7 @@ mod tests {
         let meta = create_meta_store_from_url("sqlite::memory:")
             .await
             .unwrap()
-            .layer();
+            .store();
         let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
 
         let ino: i64 = 22;
@@ -884,11 +552,7 @@ mod tests {
         let slice_id1 = meta.next_id(SLICE_ID_KEY).await.unwrap();
         let uploader = DataUploader::new(layout, chunk_id_for(ino, 0), backend.as_ref());
         let desc1 = uploader
-            .write_at_vectored(
-                slice_id1 as u64,
-                0,
-                &[bytes::Bytes::copy_from_slice(&data1)],
-            )
+            .write_at(slice_id1 as u64, 0, &data1)
             .await
             .unwrap();
         meta.append_slice(chunk_id_for(ino, 0), desc1)
@@ -903,11 +567,7 @@ mod tests {
 
         let slice_id2 = meta.next_id(SLICE_ID_KEY).await.unwrap();
         let desc2 = uploader
-            .write_at_vectored(
-                slice_id2 as u64,
-                0,
-                &[bytes::Bytes::copy_from_slice(&data2)],
-            )
+            .write_at(slice_id2 as u64, 0, &data2)
             .await
             .unwrap();
         meta.append_slice(chunk_id_for(ino, 0), desc2)
@@ -929,7 +589,7 @@ mod tests {
         let meta = create_meta_store_from_url("sqlite::memory:")
             .await
             .unwrap()
-            .layer();
+            .store();
         let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
 
         let ino: i64 = 66;
@@ -944,7 +604,7 @@ mod tests {
 
         let writer = Arc::new(FileWriter::new(
             inode,
-            Arc::new(WriteConfig::new(layout).page_size(4 * 1024)),
+            Arc::new(WriteConfig::new(layout, 4 * 1024)),
             backend.clone(),
             reader,
         ));

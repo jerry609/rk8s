@@ -1,33 +1,20 @@
-// Write pipeline (high-level):
-// - FileWriter::write_at splits a file write into chunk spans and appends data into SliceState
-//   (Writeable). Slices are append-only and live inside each ChunkState.
-// - When a slice is frozen (Readonly), it becomes eligible for upload. auto_flush and explicit
-//   flush() can freeze slices. spawn_flush_slice performs the upload:
-//     Readonly -> Uploading -> Uploaded/Failed
-// - commit_chunk runs per-chunk and waits for Uploaded slices. It appends metadata (SliceDesc)
-//   to the metadata layer and marks them Committed. Only Committed slices are visible to readers.
-// - FileWriter::flush() freezes all slices and waits until commit threads drain the chunks.
-//   While flushing, new writes are blocked via flush_waiting/write_waiting gates.
-
 use super::reader::DataReader;
 use crate::chuck::writer::DataUploader;
 use crate::chuck::{BlockStore, SliceDesc};
+use crate::file_io::split_chunk_spans;
+use crate::file_io::{Inode, chunk_id_for};
 use crate::meta::backoff::backoff;
 use crate::meta::store::MetaError;
 use crate::meta::{MetaLayer, SLICE_ID_KEY};
 use crate::vfs::backend::Backend;
 use crate::vfs::cache::page::CacheSlice;
-use crate::vfs::chunk_id_for;
 use crate::vfs::config::WriteConfig;
 use crate::vfs::extract_ino_and_chunk_index;
-use crate::vfs::inode::Inode;
-use crate::vfs::io::split_chunk_spans;
 use bytes::Bytes;
 use dashmap::DashMap;
-use parking_lot::Mutex as ParkingMutex;
 use rand::RngCore;
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{interval, timeout};
@@ -111,7 +98,7 @@ impl SliceState {
 pub(crate) struct ChunkState {
     /// ID of the chunk.
     chunk_id: u64,
-    slices: VecDeque<Arc<ParkingMutex<SliceState>>>,
+    slices: VecDeque<Arc<StdMutex<SliceState>>>,
     commit_started: bool,
 }
 
@@ -130,7 +117,7 @@ where
     B: BlockStore,
     M: MetaLayer,
 {
-    slice: &'a Arc<ParkingMutex<SliceState>>,
+    slice: &'a Arc<StdMutex<SliceState>>,
     shared: &'a Shared<B, M>,
 }
 
@@ -140,12 +127,18 @@ where
     M: MetaLayer,
 {
     fn with_mut<T>(&self, f: impl FnOnce(&mut SliceState) -> T) -> T {
-        let mut guard = self.slice.lock();
+        let mut guard = self
+            .slice
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         f(&mut guard)
     }
 
     fn with_ref<T>(&self, f: impl FnOnce(&SliceState) -> T) -> T {
-        let guard = self.slice.lock();
+        let guard = self
+            .slice
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         f(&guard)
     }
 
@@ -297,7 +290,7 @@ impl SliceRuntime {
 
 struct WriteAction {
     start_commit: bool,
-    flush: Vec<Arc<ParkingMutex<SliceState>>>,
+    flush: Vec<Arc<StdMutex<SliceState>>>,
 }
 
 struct ChunkHandle<'a, B, M>
@@ -321,7 +314,7 @@ where
         &mut self,
         offset: u32,
         len: usize,
-    ) -> anyhow::Result<(Arc<ParkingMutex<SliceState>>, WriteAction)> {
+    ) -> anyhow::Result<(Arc<StdMutex<SliceState>>, WriteAction)> {
         let (chunk_id, mut slices) = {
             let chunk = self
                 .inner
@@ -337,7 +330,7 @@ where
             "A write operation cannot exceed the chunk size"
         );
 
-        let mut found: Option<Arc<ParkingMutex<SliceState>>> = None;
+        let mut found: Option<Arc<StdMutex<SliceState>>> = None;
         let mut flush = Vec::new();
         for (idx, slice) in slices.iter().rev().enumerate() {
             let handle = SliceHandle {
@@ -359,7 +352,7 @@ where
         let slice = match found {
             Some(slice) => slice,
             None => {
-                let slice = Arc::new(ParkingMutex::new(SliceState::new(
+                let slice = Arc::new(StdMutex::new(SliceState::new(
                     chunk_id,
                     offset,
                     self.shared.config.clone(),
@@ -539,7 +532,6 @@ where
 
     // Write path: split into chunk spans, append to per-chunk slices, and possibly
     // trigger background flush/commit. Updates in-memory inode size at the end.
-    #[tracing::instrument(level = "trace", skip(self, buf), fields(offset, len = buf.len()))]
     pub(crate) async fn write_at(&self, offset: u64, buf: &[u8]) -> anyhow::Result<usize> {
         let mut guard = self.shared.inner.lock().await;
 
@@ -593,7 +585,6 @@ where
 
     // Flush: freeze all slices, upload them, and wait for commit threads to drain.
     // This blocks new writes until flushing completes (flush_waiting gate).
-    #[tracing::instrument(level = "trace", skip(self))]
     pub(crate) async fn flush(&self) -> anyhow::Result<()> {
         {
             let mut guard = self.shared.inner.lock().await;
@@ -614,7 +605,7 @@ where
             let mut to_flush = Vec::new();
             {
                 let guard = self.shared.inner.lock().await;
-                let slices: Vec<Arc<ParkingMutex<SliceState>>> = guard
+                let slices: Vec<Arc<StdMutex<SliceState>>> = guard
                     .chunks
                     .values()
                     .flat_map(|chunk| chunk.slices.iter().cloned())
@@ -673,7 +664,7 @@ where
 
     /// Spawn a background task to upload a frozen slice's data.
     /// Metadata commit is handled separately by commit_chunk.
-    fn spawn_flush_slice(shared: Arc<Shared<B, M>>, slice: Arc<ParkingMutex<SliceState>>) {
+    fn spawn_flush_slice(shared: Arc<Shared<B, M>>, slice: Arc<StdMutex<SliceState>>) {
         let handle = SliceHandle {
             slice: &slice,
             shared: &shared,
@@ -684,7 +675,7 @@ where
         Self::spawn_upload_task(shared, slice);
     }
 
-    fn spawn_upload_task(shared: Arc<Shared<B, M>>, slice: Arc<ParkingMutex<SliceState>>) {
+    fn spawn_upload_task(shared: Arc<Shared<B, M>>, slice: Arc<StdMutex<SliceState>>) {
         tokio::spawn(async move {
             let handle = SliceHandle {
                 slice: &slice,
@@ -1065,7 +1056,7 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     fn test_config(layout: ChunkLayout) -> Arc<WriteConfig> {
-        Arc::new(WriteConfig::new(layout).page_size(4 * 1024))
+        Arc::new(WriteConfig::new(layout, 4 * 1024))
     }
 
     struct BlockingStore {
@@ -1124,7 +1115,7 @@ mod tests {
         let meta = create_meta_store_from_url("sqlite::memory:")
             .await
             .unwrap()
-            .layer();
+            .store();
         let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
         let inode = Inode::new(11, 0);
         let reader = Arc::new(DataReader::new(
@@ -1161,7 +1152,7 @@ mod tests {
         let meta = create_meta_store_from_url("sqlite::memory:")
             .await
             .unwrap()
-            .layer();
+            .store();
         let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
         let inode = Inode::new(22, 0);
         let reader = Arc::new(DataReader::new(
@@ -1199,7 +1190,7 @@ mod tests {
         let meta = create_meta_store_from_url("sqlite::memory:")
             .await
             .unwrap()
-            .layer();
+            .store();
         let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
         let inode = Inode::new(33, 0);
 
@@ -1236,7 +1227,7 @@ mod tests {
         let meta = create_meta_store_from_url("sqlite::memory:")
             .await
             .unwrap()
-            .layer();
+            .store();
         let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
         let inode = Inode::new(44, 0);
 
@@ -1293,7 +1284,7 @@ mod tests {
         let meta = create_meta_store_from_url("sqlite::memory:")
             .await
             .unwrap()
-            .layer();
+            .store();
         let backend = Arc::new(Backend::new(store.clone(), meta.clone()));
 
         let reader = Arc::new(DataReader::new(
@@ -1301,9 +1292,7 @@ mod tests {
             backend.clone(),
         ));
         let write_cfg = Arc::new(
-            WriteConfig::new(layout)
-                .page_size(4 * 1024)
-                .flush_all_interval(Duration::from_millis(50)),
+            WriteConfig::new(layout, 4 * 1024).flush_all_interval(Duration::from_millis(50)),
         );
         let writer_pool = Arc::new(DataWriter::new(write_cfg, backend.clone(), reader));
         writer_pool.start_flush_background();

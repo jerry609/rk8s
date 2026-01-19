@@ -8,7 +8,6 @@ use slayerfs::cadapter::s3::{S3Backend, S3Config};
 use slayerfs::chuck::chunk::ChunkLayout;
 use slayerfs::chuck::store::ObjectBlockStore;
 use slayerfs::meta::create_meta_store_from_url;
-use slayerfs::vfs::fs::VFS;
 use slayerfs::vfs::sdk::Client;
 use std::error::Error;
 
@@ -53,13 +52,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await
         .expect("create meta store");
 
-    // Create VFS client
+    // Create SDK client (FileSystem-backed)
     let store = ObjectBlockStore::new(object_client);
     let meta_store = meta_handle.store();
-    let vfs = VFS::new(layout, store, meta_store)
+    let client = Client::new(layout, store, meta_store)
         .await
-        .expect("create vfs fail.");
-    let client = Client::from_vfs(vfs);
+        .expect("create filesystem client");
 
     // Test basic operations
     println!("Testing basic S3 operations...");

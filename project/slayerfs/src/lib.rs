@@ -6,6 +6,8 @@
 pub mod cadapter;
 pub mod chuck;
 pub mod daemon;
+pub mod file_io;
+pub mod fs;
 pub mod fuse;
 pub mod meta;
 pub mod sdk_fs;
