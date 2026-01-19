@@ -14,12 +14,13 @@ use crate::chuck::store::BlockStore;
 use crate::file_io::{ChunkIoFactory, FileRegistry, Inode};
 use crate::meta::client::MetaClient;
 use crate::meta::config::MetaClientConfig;
+use crate::meta::permission::Permission;
 use crate::meta::store::{
     DirEntry, FileAttr, FileType, MetaError, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
 };
 use crate::meta::MetaStore;
 use dashmap::Entry;
-use libc::{getegid, geteuid};
+use libc::{getegid, geteuid, getgroups};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -266,6 +267,57 @@ fn make_log_context() -> LogContext {
     LogContext::new(uid, gid, pid)
 }
 
+fn current_ids() -> (u32, u32) {
+    let uid = unsafe { geteuid() as u32 };
+    let gid = unsafe { getegid() as u32 };
+    (uid, gid)
+}
+
+#[derive(Debug, Clone)]
+pub struct CallerIdentity {
+    pub uid: u32,
+    pub gid: u32,
+    pub groups: Vec<u32>,
+}
+
+impl CallerIdentity {
+    pub fn new(uid: u32, gid: u32, groups: Vec<u32>) -> Self {
+        Self { uid, gid, groups }
+    }
+
+    pub fn current() -> Self {
+        let (uid, gid) = current_ids();
+        let groups = current_groups(gid);
+        Self { uid, gid, groups }
+    }
+
+    pub fn root() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            groups: vec![0],
+        }
+    }
+}
+
+fn current_groups(primary_gid: u32) -> Vec<u32> {
+    let mut groups = Vec::new();
+    unsafe {
+        let count = getgroups(0, std::ptr::null_mut());
+        if count > 0 {
+            let mut buf = vec![0 as libc::gid_t; count as usize];
+            let res = getgroups(count, buf.as_mut_ptr());
+            if res >= 0 {
+                groups.extend(buf.into_iter().take(res as usize).map(|g| g as u32));
+            }
+        }
+    }
+    if !groups.contains(&primary_gid) {
+        groups.push(primary_gid);
+    }
+    groups
+}
+
 /// FileSystem configuration.
 #[derive(Debug, Clone)]
 pub struct FileSystemConfig {
@@ -273,6 +325,10 @@ pub struct FileSystemConfig {
     pub access_log: bool,
     /// Access log buffer size.
     pub access_log_buffer_size: usize,
+    /// Enforce POSIX-style permission checks.
+    pub enforce_permissions: bool,
+    /// Caller identity used for permission checks.
+    pub caller: CallerIdentity,
 }
 
 impl Default for FileSystemConfig {
@@ -280,7 +336,21 @@ impl Default for FileSystemConfig {
         Self {
             access_log: false,
             access_log_buffer_size: 1024,
+            enforce_permissions: true,
+            caller: CallerIdentity::current(),
         }
+    }
+}
+
+impl FileSystemConfig {
+    pub fn with_caller(mut self, caller: CallerIdentity) -> Self {
+        self.caller = caller;
+        self
+    }
+
+    pub fn with_permissions(mut self, enforce: bool) -> Self {
+        self.enforce_permissions = enforce;
+        self
     }
 }
 
@@ -336,6 +406,14 @@ where
     config: FileSystemConfig,
     access_log_tx: Option<mpsc::Sender<AccessLogEntry>>,
     next_file_id: AtomicU64,
+}
+
+bitflags::bitflags! {
+    struct AccessMask: u8 {
+        const READ = 0b001;
+        const WRITE = 0b010;
+        const EXEC = 0b100;
+    }
 }
 
 impl<S, M> FileSystem<S, M>
@@ -538,6 +616,79 @@ where
         }
     }
 
+    fn permission_for(attr: &FileAttr) -> Permission {
+        Permission {
+            mode: attr.mode,
+            uid: attr.uid,
+            gid: attr.gid,
+            acl: None,
+        }
+    }
+
+    fn desired_gid(parent_attr: &FileAttr, current_gid: u32) -> u32 {
+        if parent_attr.mode & 0o2000 != 0 {
+            parent_attr.gid
+        } else {
+            current_gid
+        }
+    }
+
+    fn check_access(&self, attr: &FileAttr, mask: AccessMask, path: &str) -> io::Result<()> {
+        if !self.config.enforce_permissions {
+            return Ok(());
+        }
+        let caller = &self.config.caller;
+        let perm = Self::permission_for(attr);
+        if mask.contains(AccessMask::READ) && !perm.can_read(caller.uid, &caller.groups) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{path}: read permission denied"),
+            ));
+        }
+        if mask.contains(AccessMask::WRITE) && !perm.can_write(caller.uid, &caller.groups) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{path}: write permission denied"),
+            ));
+        }
+        if mask.contains(AccessMask::EXEC) && !perm.can_execute(caller.uid, &caller.groups) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{path}: execute permission denied"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_owner(&self, attr: &FileAttr, path: &str) -> io::Result<()> {
+        if !self.config.enforce_permissions {
+            return Ok(());
+        }
+        let caller = &self.config.caller;
+        if caller.uid == 0 || caller.uid == attr.uid {
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{path}: ownership required"),
+        ))
+    }
+
+    async fn apply_owner(&self, ino: i64, parent_attr: &FileAttr, path: &str) -> io::Result<()> {
+        let caller = &self.config.caller;
+        let gid = Self::desired_gid(parent_attr, caller.gid);
+        let req = SetAttrRequest {
+            uid: Some(caller.uid),
+            gid: Some(gid),
+            ..Default::default()
+        };
+        self.meta_layer
+            .set_attr(ino, &req, SetAttrFlags::empty())
+            .await
+            .map_err(|e| meta_error_to_io(path, e))?;
+        Ok(())
+    }
+
     /// Open a file with the given flags.
     pub async fn open(&self, path: &str, flags: OpenFlags) -> io::Result<File<S, M>> {
         let path = Self::normalize_path(path);
@@ -575,6 +726,16 @@ where
                     io::ErrorKind::InvalidInput,
                     "cannot open directory as file",
                 ));
+            }
+            let mut access = AccessMask::empty();
+            if flags.read {
+                access |= AccessMask::READ;
+            }
+            if flags.write {
+                access |= AccessMask::WRITE;
+            }
+            if !access.is_empty() {
+                self.check_access(fi.attr(), access, &path)?;
             }
 
             // Handle truncate
@@ -618,6 +779,16 @@ where
                     "cannot open directory as file",
                 ));
             }
+            let mut access = AccessMask::empty();
+            if flags.read {
+                access |= AccessMask::READ;
+            }
+            if flags.write {
+                access |= AccessMask::WRITE;
+            }
+            if !access.is_empty() {
+                self.check_access(fi.attr(), access, &path)?;
+            }
 
             let file_id = self.next_file_id.fetch_add(1, Ordering::Relaxed);
 
@@ -644,30 +815,10 @@ where
         self.open(path, OpenFlags::create_new()).await
     }
 
-    /// Create a regular file (mkdir -p on its parent if needed).
+    /// Create a regular file in an existing parent directory.
     pub async fn create_file(&self, path: &str) -> io::Result<i64> {
         let path = Self::normalize_path(path);
-        if path == "/" {
-            return Err(io::Error::new(io::ErrorKind::IsADirectory, path));
-        }
-        let (dir, name) = Self::split_dir_file(&path);
-        let dir_ino = self.mkdir_p(&dir).await?;
-
-        if let Ok(Some(ino)) = self.meta_layer.lookup(dir_ino, &name).await {
-            if let Some(attr) = self.meta_layer.stat(ino).await.map_err(|e| meta_error_to_io(&path, e))? {
-                if attr.kind == FileType::Dir {
-                    return Err(io::Error::new(io::ErrorKind::IsADirectory, path));
-                }
-                return Ok(ino);
-            }
-        }
-
-        let ino = self
-            .meta_layer
-            .create_file(dir_ino, name)
-            .await
-            .map_err(|e| meta_error_to_io(&path, e))?;
-        Ok(ino)
+        self.create_file_in_existing_dir(&path, false).await
     }
 
     /// Check if a path exists.
@@ -706,6 +857,38 @@ where
                 }
                 ino
             };
+            let parent_attr = self
+                .meta_layer
+                .stat(parent_ino)
+                .await
+                .map_err(|e| meta_error_to_io(&dir, e))?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, dir.clone()))?;
+            if parent_attr.kind != FileType::Dir {
+                return Err(io::Error::new(io::ErrorKind::NotADirectory, dir));
+            }
+            self.check_access(&parent_attr, AccessMask::WRITE | AccessMask::EXEC, &dir)?;
+            self.check_access(&parent_attr, AccessMask::WRITE | AccessMask::EXEC, &dir)?;
+            let parent_attr = self
+                .meta_layer
+                .stat(parent_ino)
+                .await
+                .map_err(|e| meta_error_to_io(&dir, e))?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, dir.clone()))?;
+            if parent_attr.kind != FileType::Dir {
+                return Err(io::Error::new(io::ErrorKind::NotADirectory, dir));
+            }
+            self.check_access(&parent_attr, AccessMask::WRITE | AccessMask::EXEC, &dir)?;
+
+            let parent_attr = self
+                .meta_layer
+                .stat(parent_ino)
+                .await
+                .map_err(|e| meta_error_to_io(&dir, e))?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, dir.clone()))?;
+            if parent_attr.kind != FileType::Dir {
+                return Err(io::Error::new(io::ErrorKind::NotADirectory, dir));
+            }
+            self.check_access(&parent_attr, AccessMask::WRITE | AccessMask::EXEC, &dir)?;
 
             if let Some(ino) = self
                 .meta_layer
@@ -725,10 +908,12 @@ where
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, path));
             }
 
-            self.meta_layer
+            let ino = self
+                .meta_layer
                 .mkdir(parent_ino, name)
                 .await
                 .map_err(|e| meta_error_to_io(&path, e))?;
+            self.apply_owner(ino, &parent_attr, &path).await?;
             Ok(())
         }
         .await;
@@ -884,6 +1069,20 @@ where
                     .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, old_dir.clone()))?
                     .0
             };
+            let old_parent_attr = self
+                .meta_layer
+                .stat(old_parent_ino)
+                .await
+                .map_err(|e| meta_error_to_io(&old_dir, e))?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, old_dir.clone()))?;
+            if old_parent_attr.kind != FileType::Dir {
+                return Err(io::Error::new(io::ErrorKind::NotADirectory, old_dir.clone()));
+            }
+            self.check_access(
+                &old_parent_attr,
+                AccessMask::WRITE | AccessMask::EXEC,
+                &old_dir,
+            )?;
 
             let src_ino = self
                 .meta_layer
@@ -909,6 +1108,20 @@ where
                         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, new_dir.clone()))?
                         .0
                 };
+                let new_parent_attr = self
+                    .meta_layer
+                    .stat(new_dir_ino)
+                    .await
+                    .map_err(|e| meta_error_to_io(&new_dir, e))?
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, new_dir.clone()))?;
+                if new_parent_attr.kind != FileType::Dir {
+                    return Err(io::Error::new(io::ErrorKind::NotADirectory, new_dir.clone()));
+                }
+                self.check_access(
+                    &new_parent_attr,
+                    AccessMask::WRITE | AccessMask::EXEC,
+                    &new_dir,
+                )?;
 
                 if dest_kind == FileType::Dir {
                     if src_attr.kind != FileType::Dir {
@@ -937,10 +1150,34 @@ where
                 }
             }
 
-            let new_dir_ino = self
-                .mkdir_p(&new_dir)
+            let new_dir_ino = if &new_dir == "/" {
+                self.meta_layer.root_ino()
+            } else {
+                let (ino, kind) = self
+                    .meta_layer
+                    .lookup_path(&new_dir)
+                    .await
+                    .map_err(|e| meta_error_to_io(&new_dir, e))?
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, new_dir.clone()))?;
+                if kind != FileType::Dir {
+                    return Err(io::Error::new(io::ErrorKind::NotADirectory, new_dir));
+                }
+                ino
+            };
+            let new_parent_attr = self
+                .meta_layer
+                .stat(new_dir_ino)
                 .await
-                .map_err(|e| io::Error::new(e.kind(), e.to_string()))?;
+                .map_err(|e| meta_error_to_io(&new_dir, e))?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, new_dir.clone()))?;
+            if new_parent_attr.kind != FileType::Dir {
+                return Err(io::Error::new(io::ErrorKind::NotADirectory, new_dir));
+            }
+            self.check_access(
+                &new_parent_attr,
+                AccessMask::WRITE | AccessMask::EXEC,
+                &new_dir,
+            )?;
             self.meta_layer
                 .rename(old_parent_ino, &old_name, new_dir_ino, new_name)
                 .await
@@ -1000,6 +1237,11 @@ where
             if parent_attr.kind != FileType::Dir {
                 return Err(io::Error::new(io::ErrorKind::NotADirectory, parent_path));
             }
+            self.check_access(
+                &parent_attr,
+                AccessMask::WRITE | AccessMask::EXEC,
+                &parent_path,
+            )?;
 
             if self
                 .meta_layer
@@ -1067,10 +1309,12 @@ where
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, link));
             }
 
-            self.meta_layer
+            let (ino, _) = self
+                .meta_layer
                 .symlink(parent_ino, &name, target)
                 .await
                 .map_err(|e| meta_error_to_io(&link, e))?;
+            self.apply_owner(ino, &parent_attr, &link).await?;
             Ok(())
         }
         .await;
@@ -1120,6 +1364,13 @@ where
                 }
                 _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, path)),
             }
+            let attr = self
+                .meta_layer
+                .stat(ino)
+                .await
+                .map_err(|e| meta_error_to_io(&path, e))?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, path.clone()))?;
+            self.check_access(&attr, AccessMask::WRITE, &path)?;
 
             if let Some(inode) = self.files.inode(ino) {
                 inode.update_size(size);
@@ -1146,6 +1397,28 @@ where
         let log_ctx = self.log_context();
         let result = async {
             let fi = self.resolve(&path, true).await?;
+            let attr = fi.attr();
+            if req.mode.is_some()
+                || req.uid.is_some()
+                || req.gid.is_some()
+                || flags.contains(SetAttrFlags::CLEAR_SUID)
+                || flags.contains(SetAttrFlags::CLEAR_SGID)
+            {
+                self.check_owner(attr, &path)?;
+            }
+            if req.size.is_some() {
+                self.check_access(attr, AccessMask::WRITE, &path)?;
+            }
+            if req.atime.is_some()
+                || req.mtime.is_some()
+                || req.ctime.is_some()
+                || flags.contains(SetAttrFlags::SET_ATIME_NOW)
+                || flags.contains(SetAttrFlags::SET_MTIME_NOW)
+            {
+                if self.check_owner(attr, &path).is_err() {
+                    self.check_access(attr, AccessMask::WRITE, &path)?;
+                }
+            }
             let attr = self
                 .meta_layer
                 .set_attr(fi.inode(), req, flags)
@@ -1177,6 +1450,13 @@ where
             if kind != FileType::Dir {
                 return Err(io::Error::new(io::ErrorKind::NotADirectory, path));
             }
+            let attr = self
+                .meta_layer
+                .stat(ino)
+                .await
+                .map_err(|e| meta_error_to_io(&path, e))?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, path.clone()))?;
+            self.check_access(&attr, AccessMask::READ | AccessMask::EXEC, &path)?;
             self.meta_layer
                 .readdir(ino)
                 .await
@@ -1193,6 +1473,7 @@ where
         let log_ctx = self.log_context();
         let result = async {
             let fi = self.resolve(&path, true).await?;
+            self.check_access(fi.attr(), AccessMask::READ, &path)?;
             read_inode(
                 self.meta_layer.as_ref(),
                 self.files.as_ref(),
@@ -1214,6 +1495,7 @@ where
         let log_ctx = self.log_context();
         let result = async {
             let fi = self.resolve(&path, true).await?;
+            self.check_access(fi.attr(), AccessMask::WRITE, &path)?;
             write_inode(
                 self.meta_layer.as_ref(),
                 self.files.as_ref(),
@@ -1281,10 +1563,21 @@ where
 
         let mut cur_ino = self.meta_layer.root_ino();
         let mut cur_path = String::new();
+        let mut cur_attr = self
+            .meta_layer
+            .stat(cur_ino)
+            .await
+            .map_err(|e| meta_error_to_io(&path, e))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, path.clone()))?;
         for part in path.trim_start_matches('/').split('/') {
             if part.is_empty() {
                 continue;
             }
+            let parent_path = if cur_path.is_empty() {
+                "/".to_string()
+            } else {
+                cur_path.clone()
+            };
             cur_path.push('/');
             cur_path.push_str(part);
 
@@ -1304,15 +1597,26 @@ where
                     if attr.kind != FileType::Dir {
                         return Err(io::Error::new(io::ErrorKind::NotADirectory, cur_path));
                     }
+                    self.check_access(&attr, AccessMask::EXEC, &cur_path)?;
                     cur_ino = ino;
+                    cur_attr = attr;
                 }
                 None => {
+                    self.check_access(&cur_attr, AccessMask::WRITE | AccessMask::EXEC, &parent_path)?;
                     let ino = self
                         .meta_layer
                         .mkdir(cur_ino, part.to_string())
                         .await
                         .map_err(|e| meta_error_to_io(&cur_path, e))?;
+                    self.apply_owner(ino, &cur_attr, &cur_path).await?;
+                    let attr = self
+                        .meta_layer
+                        .stat(ino)
+                        .await
+                        .map_err(|e| meta_error_to_io(&cur_path, e))?
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, cur_path.clone()))?;
                     cur_ino = ino;
+                    cur_attr = attr;
                 }
             }
         }
@@ -1350,6 +1654,16 @@ where
             }
             ino
         };
+        let parent_attr = self
+            .meta_layer
+            .stat(parent_ino)
+            .await
+            .map_err(|e| meta_error_to_io(&dir, e))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, dir.clone()))?;
+        if parent_attr.kind != FileType::Dir {
+            return Err(io::Error::new(io::ErrorKind::NotADirectory, dir));
+        }
+        self.check_access(&parent_attr, AccessMask::WRITE | AccessMask::EXEC, &dir)?;
 
         if let Some(existing) = self
             .meta_layer
@@ -1377,6 +1691,7 @@ where
             .create_file(parent_ino, name)
             .await
             .map_err(|e| meta_error_to_io(path, e))?;
+        self.apply_owner(ino, &parent_attr, path).await?;
         Ok(ino)
     }
 }
@@ -1799,7 +2114,10 @@ mod tests {
         let meta_handle = create_meta_store_from_url("sqlite::memory:").await.unwrap();
         let metadata: Arc<dyn MetaStore> = meta_handle.store();
         let store = ObjectBlockStore::new(client);
-        FileSystem::new(layout, store, metadata).await.unwrap()
+        let config = FileSystemConfig::default().with_caller(CallerIdentity::root());
+        FileSystem::with_config(layout, store, metadata, config)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]

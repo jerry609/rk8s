@@ -9,6 +9,7 @@ use crate::meta::config::{Config, DatabaseType};
 use crate::meta::entities::link_parent_meta;
 use crate::meta::entities::session_meta::{self, Entity as SessionMeta};
 use crate::meta::entities::slice_meta::{self, Entity as SliceMeta};
+use crate::meta::entities::xattr_meta;
 use crate::meta::entities::*;
 use crate::meta::file_lock::{
     FileLockInfo, FileLockQuery, FileLockRange, FileLockType, PlockRecord,
@@ -227,6 +228,10 @@ impl DatabaseMetaStore {
                 .to_owned(),
             schema
                 .create_table_from_entity(PlockMeta)
+                .if_not_exists()
+                .to_owned(),
+            schema
+                .create_table_from_entity(XattrMeta)
                 .if_not_exists()
                 .to_owned(),
         ];
@@ -1098,6 +1103,12 @@ impl MetaStore for DatabaseMetaStore {
 
         // Delete access meta
         AccessMeta::delete_by_id(dir_id)
+            .exec(&txn)
+            .await
+            .map_err(MetaError::Database)?;
+
+        XattrMeta::delete_many()
+            .filter(xattr_meta::Column::Inode.eq(dir_id))
             .exec(&txn)
             .await
             .map_err(MetaError::Database)?;
@@ -2342,6 +2353,12 @@ impl MetaStore for DatabaseMetaStore {
             .await
             .map_err(MetaError::Database)?;
 
+        XattrMeta::delete_many()
+            .filter(xattr_meta::Column::Inode.eq(ino))
+            .exec(&txn)
+            .await
+            .map_err(MetaError::Database)?;
+
         txn.commit().await.map_err(MetaError::Database)?;
 
         Ok(())
@@ -2506,6 +2523,92 @@ impl MetaStore for DatabaseMetaStore {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    async fn set_xattr(
+        &self,
+        inode: i64,
+        name: &str,
+        value: &[u8],
+        flags: u32,
+    ) -> Result<(), MetaError> {
+        if self.stat(inode).await?.is_none() {
+            return Err(MetaError::NotFound(inode));
+        }
+        let txn = self.db.begin().await.map_err(MetaError::Database)?;
+        let existing = XattrMeta::find_by_id((inode, name.to_string()))
+            .one(&txn)
+            .await
+            .map_err(MetaError::Database)?;
+        let create_only = flags & (libc::XATTR_CREATE as u32) != 0;
+        let replace_only = flags & (libc::XATTR_REPLACE as u32) != 0;
+
+        match existing {
+            Some(entry) => {
+                if create_only {
+                    txn.rollback().await.map_err(MetaError::Database)?;
+                    return Err(MetaError::AlreadyExists {
+                        parent: inode,
+                        name: name.to_string(),
+                    });
+                }
+                let mut active: xattr_meta::ActiveModel = entry.into();
+                active.value = Set(value.to_vec());
+                active.update(&txn).await.map_err(MetaError::Database)?;
+            }
+            None => {
+                if replace_only {
+                    txn.rollback().await.map_err(MetaError::Database)?;
+                    return Err(MetaError::NotFound(inode));
+                }
+                let active = xattr_meta::ActiveModel {
+                    inode: Set(inode),
+                    name: Set(name.to_string()),
+                    value: Set(value.to_vec()),
+                };
+                active.insert(&txn).await.map_err(MetaError::Database)?;
+            }
+        }
+
+        txn.commit().await.map_err(MetaError::Database)?;
+        Ok(())
+    }
+
+    async fn get_xattr(&self, inode: i64, name: &str) -> Result<Option<Vec<u8>>, MetaError> {
+        if self.stat(inode).await?.is_none() {
+            return Err(MetaError::NotFound(inode));
+        }
+        let entry = XattrMeta::find_by_id((inode, name.to_string()))
+            .one(&self.db)
+            .await
+            .map_err(MetaError::Database)?;
+        Ok(entry.map(|e| e.value))
+    }
+
+    async fn list_xattr(&self, inode: i64) -> Result<Vec<String>, MetaError> {
+        if self.stat(inode).await?.is_none() {
+            return Err(MetaError::NotFound(inode));
+        }
+        let entries = XattrMeta::find()
+            .filter(xattr_meta::Column::Inode.eq(inode))
+            .all(&self.db)
+            .await
+            .map_err(MetaError::Database)?;
+        Ok(entries.into_iter().map(|e| e.name).collect())
+    }
+
+    async fn remove_xattr(&self, inode: i64, name: &str) -> Result<(), MetaError> {
+        if self.stat(inode).await?.is_none() {
+            return Err(MetaError::NotFound(inode));
+        }
+        let result = XattrMeta::delete_by_id((inode, name.to_string()))
+            .exec(&self.db)
+            .await
+            .map_err(MetaError::Database)?;
+        if result.rows_affected == 0 {
+            return Err(MetaError::NotFound(inode));
+        }
+        Ok(())
     }
 }
 

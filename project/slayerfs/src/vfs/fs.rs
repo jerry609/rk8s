@@ -7,7 +7,7 @@ use crate::meta::MetaLayer;
 use crate::meta::client::{MetaClient, MetaClientOptions};
 use crate::meta::config::{CacheCapacity, CacheTtl, MetaClientConfig};
 use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
-use crate::meta::store::{MetaError, MetaStore, SetAttrFlags, SetAttrRequest, StatFsSnapshot};
+use crate::meta::store::{AclRule, MetaError, MetaStore, SetAttrFlags, SetAttrRequest, StatFsSnapshot};
 use dashmap::{DashMap, Entry};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1950,6 +1950,49 @@ where
         Ok(written)
     }
 
+    /// Write data by inode directly (used by FUSE to avoid path resolution).
+    pub async fn write_ino(
+        &self,
+        ino: i64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize, VfsError> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let attr = self
+            .core
+            .meta_layer
+            .stat(ino)
+            .await
+            .map_err(VfsError::from)?
+            .ok_or(VfsError::NotFound {
+                path: PathHint::none(),
+            })?;
+        if attr.kind == FileType::Dir {
+            return Err(VfsError::IsADirectory {
+                path: PathHint::none(),
+            });
+        }
+        if attr.kind != FileType::File {
+            return Err(VfsError::InvalidInput);
+        }
+
+        let inode = self.ensure_inode_registered(ino).await?;
+        let writer = self.state.writer.ensure_file(inode);
+        let written = writer.write_at(offset, data).await.map_err(VfsError::from)?;
+
+        let target_size = offset + written as u64;
+        self.core
+            .meta_layer
+            .extend_file_size(ino, target_size)
+            .await
+            .map_err(VfsError::from)?;
+        self.state.modified.touch(ino).await;
+        Ok(written)
+    }
+
     /// Allocate a per-file handle, returning the opaque fh id.
     pub async fn open(
         &self,
@@ -2153,6 +2196,54 @@ where
             .map_err(VfsError::from)
     }
 
+    /// Set xattr for a given inode.
+    pub async fn set_xattr_ino(
+        &self,
+        inode: i64,
+        name: &str,
+        value: &[u8],
+        flags: u32,
+    ) -> Result<(), MetaError> {
+        self.core
+            .meta_layer
+            .set_xattr(inode, name, value, flags)
+            .await
+    }
+
+    /// Get xattr for a given inode.
+    pub async fn get_xattr_ino(
+        &self,
+        inode: i64,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, MetaError> {
+        self.core.meta_layer.get_xattr(inode, name).await
+    }
+
+    /// List xattr names for a given inode.
+    pub async fn list_xattr_ino(&self, inode: i64) -> Result<Vec<String>, MetaError> {
+        self.core.meta_layer.list_xattr(inode).await
+    }
+
+    /// Remove xattr for a given inode.
+    pub async fn remove_xattr_ino(&self, inode: i64, name: &str) -> Result<(), MetaError> {
+        self.core.meta_layer.remove_xattr(inode, name).await
+    }
+
+    /// Set ACL rule for a given inode.
+    pub async fn set_acl_ino(&self, inode: i64, rule: AclRule) -> Result<(), MetaError> {
+        self.core.meta_layer.set_acl(inode, rule).await
+    }
+
+    /// Get ACL rule for a given inode.
+    pub async fn get_acl_ino(
+        &self,
+        inode: i64,
+        acl_type: u8,
+        acl_id: u32,
+    ) -> Result<Option<AclRule>, MetaError> {
+        self.core.meta_layer.get_acl(inode, acl_type, acl_id).await
+    }
+
     /// Get file lock information by path.
     pub async fn get_plock(
         &self,
@@ -2223,10 +2314,10 @@ where
         self.core.meta_layer.stat_fs().await
     }
 
-    async fn ensure_inode_registered(&self, ino: i64) -> Result<Arc<Inode>, String> {
-        // fast path to check whether there is an existing inode.
-        if let Some(inode) = self.state.files.inode(ino) {
-            return Ok(inode.clone());
+    async fn ensure_inode_registered(&self, ino: i64) -> Result<Arc<Inode>, VfsError> {
+        // Fast path to check whether there is an existing inode.
+        if let Some(inode) = self.state.inodes.get(&ino) {
+            return Ok(Arc::clone(inode.value()));
         }
 
         match self.lock_inode(ino) {
@@ -2236,7 +2327,8 @@ where
                     .core
                     .meta_layer
                     .stat(ino)
-                    .await?
+                    .await
+                    .map_err(VfsError::from)?
                     .ok_or(VfsError::NotFound {
                         path: PathHint::none(),
                     })?;
