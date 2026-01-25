@@ -235,3 +235,4 @@ qlean = "0.1.1"
 
 [profile.release]
 debug = true
+strip = false

@@ -8059,6 +8059,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hostname",
+ "hyper 0.14.32",
  "if-addrs",
  "libc",
  "log",
