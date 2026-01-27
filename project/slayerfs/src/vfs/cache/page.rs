@@ -33,6 +33,7 @@ impl CacheSlice {
     }
 
     /// Append a buffer behind the latest page. The buffer length must not exceed the remaining length.
+    #[tracing::instrument(level = "trace", skip(self, buf), fields(len = buf.len()))]
     pub(crate) fn append(&mut self, buf: &[u8]) -> anyhow::Result<()> {
         let max_len = self.config.layout.chunk_size;
         let next_len = self.len as u64 + buf.len() as u64;
@@ -182,13 +183,13 @@ mod tests {
     use bytes::Bytes;
 
     fn config() -> Arc<WriteConfig> {
-        Arc::new(WriteConfig::new(
-            ChunkLayout {
+        Arc::new(
+            WriteConfig::new(ChunkLayout {
                 chunk_size: 16 * 1024,
                 block_size: 4 * 1024,
-            },
-            1024,
-        ))
+            })
+            .page_size(1024),
+        )
     }
 
     fn patterned(len: usize, seed: u8) -> Vec<u8> {
