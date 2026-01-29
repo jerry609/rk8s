@@ -1,1 +1,1 @@
-pub use crate::file_io::{FileReader, FileRegistry, FileWriter};
+pub(crate) use crate::file_io::{FileReader, FileWriter};

@@ -6,7 +6,9 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
-use crate::meta::store::{DirEntry as MetaDirEntry, FileAttr as MetaFileAttr, FileType as MetaFileType};
+use crate::meta::store::{
+    DirEntry as MetaDirEntry, FileAttr as MetaFileAttr, FileType as MetaFileType,
+};
 
 // Re-export useful types from meta store
 pub use crate::meta::store::{SetAttrFlags, SetAttrRequest, StatFsSnapshot};

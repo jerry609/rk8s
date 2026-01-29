@@ -175,6 +175,29 @@ pub enum VfsError {
     Other,
 }
 
+impl VfsError {
+    pub fn from_meta(path: impl Into<PathHint>, err: MetaError) -> Self {
+        let path = path.into();
+        match err {
+            MetaError::NotFound(_) | MetaError::ParentNotFound(_) => VfsError::NotFound { path },
+            MetaError::AlreadyExists { .. } => VfsError::AlreadyExists { path },
+            MetaError::NotDirectory(_) => VfsError::NotADirectory { path },
+            MetaError::DirectoryNotEmpty(_) => VfsError::DirectoryNotEmpty { path },
+            MetaError::InvalidFilename => VfsError::InvalidFilename,
+            MetaError::InvalidPath(_) => VfsError::InvalidInput,
+            MetaError::TooManySymlinks => VfsError::InvalidInput,
+            MetaError::NotSupported(_) | MetaError::NotImplemented => VfsError::Unsupported,
+            MetaError::Io(err) => VfsError::from(err),
+            MetaError::LockConflict { .. } => VfsError::WouldBlock,
+            MetaError::LockNotFound { .. } => VfsError::NotFound { path },
+            MetaError::DeadlockDetected { .. } => VfsError::Deadlock,
+            MetaError::InvalidHandle(_) => VfsError::StaleNetworkFileHandle,
+            MetaError::Anyhow(err) => VfsError::from(err),
+            other => VfsError::Meta(other),
+        }
+    }
+}
+
 impl From<std::io::Error> for VfsError {
     fn from(value: std::io::Error) -> Self {
         // Map std::io::ErrorKind to VfsError. When no path context is available,

@@ -301,7 +301,7 @@ where
         &self,
         _req: Request,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         offset: u64,
         data: &[u8],
         _write_flags: u32,
@@ -1056,10 +1056,10 @@ where
         self.set_xattr_ino(inode as i64, &name, value, flags)
             .await
             .map_err(|e| match e {
-                MetaError::AlreadyExists { .. } => libc::EEXIST.into(),
-                MetaError::NotSupported(_) | MetaError::NotImplemented => libc::ENOSYS.into(),
-                MetaError::NotFound(_) => libc::ENODATA.into(),
-                _ => libc::EIO.into(),
+                MetaError::AlreadyExists { .. } => Errno::from(libc::EEXIST),
+                MetaError::NotSupported(_) | MetaError::NotImplemented => Errno::from(libc::ENOSYS),
+                MetaError::NotFound(_) => Errno::from(libc::ENODATA),
+                _ => Errno::from(libc::EIO),
             })
     }
 
@@ -1078,8 +1078,8 @@ where
             .get_xattr_ino(inode as i64, &name)
             .await
             .map_err(|e| match e {
-                MetaError::NotSupported(_) | MetaError::NotImplemented => libc::ENOSYS.into(),
-                _ => libc::EIO.into(),
+                MetaError::NotSupported(_) | MetaError::NotImplemented => Errno::from(libc::ENOSYS),
+                _ => Errno::from(libc::EIO),
             })?
             .ok_or_else(|| Errno::from(libc::ENODATA))?;
         if size == 0 {
@@ -1099,8 +1099,8 @@ where
             .list_xattr_ino(inode as i64)
             .await
             .map_err(|e| match e {
-                MetaError::NotSupported(_) | MetaError::NotImplemented => libc::ENOSYS.into(),
-                _ => libc::EIO.into(),
+                MetaError::NotSupported(_) | MetaError::NotImplemented => Errno::from(libc::ENOSYS),
+                _ => Errno::from(libc::EIO),
             })?;
         let total_len: usize = names.iter().map(|n| n.len() + 1).sum();
         if size == 0 {
@@ -1117,12 +1117,7 @@ where
         Ok(ReplyXAttr::Data(Bytes::from(data)))
     }
 
-    async fn removexattr(
-        &self,
-        _req: Request,
-        inode: u64,
-        name: &OsStr,
-    ) -> FuseResult<()> {
+    async fn removexattr(&self, _req: Request, inode: u64, name: &OsStr) -> FuseResult<()> {
         if self.stat_ino(inode as i64).await.is_none() {
             return Err(libc::ENOENT.into());
         }

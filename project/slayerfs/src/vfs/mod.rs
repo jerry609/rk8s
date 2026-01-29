@@ -15,12 +15,12 @@
 //! Submodules:
 //! - `handles`: file and directory handle management
 //! - `cache`: caching helpers and policies
+pub(crate) mod backend;
 pub mod cache;
-pub mod demo;
+pub(crate) mod config;
 pub mod error;
 pub mod fs;
 pub(crate) mod handles;
-pub(crate) mod inode;
 pub(crate) mod io;
 pub mod sdk;
 // Module implementation TODOs remain.

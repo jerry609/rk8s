@@ -1,6 +1,10 @@
+#![allow(dead_code)]
+
 mod cadapter;
 mod chuck;
 mod daemon;
+mod file_io;
+mod fs;
 mod fuse;
 mod meta;
 mod utils;

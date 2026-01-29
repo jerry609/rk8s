@@ -2,11 +2,11 @@
 //!
 //! Database connection configuration supporting SQLite, PostgreSQL and Etcd
 
+use crate::meta::client::MetaClientOptions;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
-use crate::meta::client::MetaClientOptions;
 
 /// SlayerFS configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,21 +134,11 @@ pub struct CacheConfig {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MetaClientConfig {
     pub capacity: CacheCapacity,
     pub ttl: CacheTtl,
     pub options: MetaClientOptions,
-}
-
-impl Default for MetaClientConfig {
-    fn default() -> Self {
-        Self {
-            capacity: CacheCapacity::default(),
-            ttl: CacheTtl::default(),
-            options: MetaClientOptions::default(),
-        }
-    }
 }
 
 impl MetaClientConfig {

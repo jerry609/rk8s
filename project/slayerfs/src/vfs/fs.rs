@@ -2,12 +2,14 @@
 
 use crate::chuck::chunk::ChunkLayout;
 use crate::chuck::store::BlockStore;
-use crate::file_io::Inode;
+use crate::file_io::{DataReader, DataWriter, Inode};
 use crate::meta::MetaLayer;
-use crate::meta::client::{MetaClient, MetaClientOptions};
-use crate::meta::config::{CacheCapacity, CacheTtl, MetaClientConfig};
+use crate::meta::client::MetaClient;
+use crate::meta::config::MetaClientConfig;
 use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
-use crate::meta::store::{AclRule, MetaError, MetaStore, SetAttrFlags, SetAttrRequest, StatFsSnapshot};
+use crate::meta::store::{
+    AclRule, MetaError, MetaStore, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
+};
 use dashmap::{DashMap, Entry};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -969,19 +971,7 @@ where
 
     /// Fetch a file's attributes (kind/size come from the MetaStore), following symlinks.
     pub async fn stat_follow_err(&self, path: &str) -> Result<FileAttr, VfsError> {
-        let path = Self::norm_path(path);
-        let ino = self
-            .core
-            .meta_layer
-            .resolve_path_follow(&path)
-            .await
-            .map_err(|e| VfsError::from_meta(path.clone(), e))?;
-        self.core
-            .meta_layer
-            .stat(ino)
-            .await
-            .map_err(|e| VfsError::from_meta(path.clone(), e))?
-            .ok_or(VfsError::NotFound { path })
+        self.stat(path).await
     }
 
     /// Read a symlink target by inode.
@@ -1951,12 +1941,7 @@ where
     }
 
     /// Write data by inode directly (used by FUSE to avoid path resolution).
-    pub async fn write_ino(
-        &self,
-        ino: i64,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<usize, VfsError> {
+    pub async fn write_ino(&self, ino: i64, offset: u64, data: &[u8]) -> Result<usize, VfsError> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -1981,7 +1966,10 @@ where
 
         let inode = self.ensure_inode_registered(ino).await?;
         let writer = self.state.writer.ensure_file(inode);
-        let written = writer.write_at(offset, data).await.map_err(VfsError::from)?;
+        let written = writer
+            .write_at(offset, data)
+            .await
+            .map_err(VfsError::from)?;
 
         let target_size = offset + written as u64;
         self.core

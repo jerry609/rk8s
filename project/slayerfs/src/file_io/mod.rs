@@ -133,7 +133,7 @@ where
             layout.block_size
         };
         let read_config = Arc::new(ReadConfig::new(layout));
-        let write_config = Arc::new(WriteConfig::new(layout, page_size));
+        let write_config = Arc::new(WriteConfig::new(layout).page_size(page_size));
         let reader_core = Arc::new(DataReader::new(read_config, Arc::clone(&backend)));
         Self {
             inode: DashMap::new(),

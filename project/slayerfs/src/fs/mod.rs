@@ -12,18 +12,19 @@
 use crate::chuck::chunk::ChunkLayout;
 use crate::chuck::store::BlockStore;
 use crate::file_io::{ChunkIoFactory, FileRegistry, Inode};
+use crate::meta::MetaStore;
 use crate::meta::client::MetaClient;
 use crate::meta::config::MetaClientConfig;
+use crate::meta::layer::MetaLayer;
 use crate::meta::permission::Permission;
 use crate::meta::store::{
     DirEntry, FileAttr, FileType, MetaError, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
 };
-use crate::meta::MetaStore;
 use dashmap::Entry;
 use libc::{getegid, geteuid, getgroups};
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::info;
@@ -308,7 +309,7 @@ fn current_groups(primary_gid: u32) -> Vec<u32> {
             let mut buf = vec![0 as libc::gid_t; count as usize];
             let res = getgroups(count, buf.as_mut_ptr());
             if res >= 0 {
-                groups.extend(buf.into_iter().take(res as usize).map(|g| g as u32));
+                groups.extend(buf.into_iter().take(res as usize));
             }
         }
     }
@@ -382,7 +383,7 @@ fn meta_error_to_io(path: &str, err: MetaError) -> io::Error {
         MetaError::InvalidHandle(_) => io::ErrorKind::InvalidInput,
         MetaError::LockConflict { .. } => io::ErrorKind::WouldBlock,
         MetaError::LockNotFound { .. } => io::ErrorKind::NotFound,
-        MetaError::Io(e) => e.kind(),
+        MetaError::Io(ref e) => e.kind(),
         _ => io::ErrorKind::Other,
     };
     io::Error::new(kind, format!("{path}: {err}"))
@@ -450,7 +451,14 @@ where
         meta: M,
         meta_config: MetaClientConfig,
     ) -> Result<Self, String> {
-        Self::with_configs(layout, store, meta, meta_config, FileSystemConfig::default()).await
+        Self::with_configs(
+            layout,
+            store,
+            meta,
+            meta_config,
+            FileSystemConfig::default(),
+        )
+        .await
     }
 
     async fn with_configs(
@@ -471,11 +479,7 @@ where
         meta_client.initialize().await.map_err(|e| e.to_string())?;
         let meta_layer: Arc<MetaClient<M>> = meta_client.clone();
         Ok(Self::from_components(
-            layout,
-            store,
-            meta,
-            meta_layer,
-            config,
+            layout, store, meta, meta_layer, config,
         ))
     }
 
@@ -530,7 +534,13 @@ where
         }
     }
 
-    fn log_result<T>(&self, ctx: Option<&LogContext>, op: &str, path: &str, result: &io::Result<T>) {
+    fn log_result<T>(
+        &self,
+        ctx: Option<&LogContext>,
+        op: &str,
+        path: &str,
+        result: &io::Result<T>,
+    ) {
         if let Some(ctx) = ctx {
             let outcome = match result {
                 Ok(_) => "ok".to_string(),
@@ -905,7 +915,7 @@ where
                 if attr.kind == FileType::Dir {
                     return Ok(());
                 }
-                return Err(io::Error::new(io::ErrorKind::AlreadyExists, path));
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, path.clone()));
             }
 
             let ino = self
@@ -964,7 +974,7 @@ where
                 .map_err(|e| meta_error_to_io(&path, e))?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, path.clone()))?;
             if attr.kind == FileType::Dir {
-                return Err(io::Error::new(io::ErrorKind::IsADirectory, path));
+                return Err(io::Error::new(io::ErrorKind::IsADirectory, path.clone()));
             }
             self.meta_layer
                 .unlink(parent_ino, &name)
@@ -1017,7 +1027,7 @@ where
                 .map_err(|e| meta_error_to_io(&path, e))?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, path.clone()))?;
             if attr.kind != FileType::Dir {
-                return Err(io::Error::new(io::ErrorKind::NotADirectory, path));
+                return Err(io::Error::new(io::ErrorKind::NotADirectory, path.clone()));
             }
             let children = self
                 .meta_layer
@@ -1025,7 +1035,10 @@ where
                 .await
                 .map_err(|e| meta_error_to_io(&path, e))?;
             if !children.is_empty() {
-                return Err(io::Error::new(io::ErrorKind::DirectoryNotEmpty, path));
+                return Err(io::Error::new(
+                    io::ErrorKind::DirectoryNotEmpty,
+                    path.clone(),
+                ));
             }
             self.meta_layer
                 .rmdir(parent_ino, &name)
@@ -1076,7 +1089,10 @@ where
                 .map_err(|e| meta_error_to_io(&old_dir, e))?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, old_dir.clone()))?;
             if old_parent_attr.kind != FileType::Dir {
-                return Err(io::Error::new(io::ErrorKind::NotADirectory, old_dir.clone()));
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    old_dir.clone(),
+                ));
             }
             self.check_access(
                 &old_parent_attr,
@@ -1115,7 +1131,10 @@ where
                     .map_err(|e| meta_error_to_io(&new_dir, e))?
                     .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, new_dir.clone()))?;
                 if new_parent_attr.kind != FileType::Dir {
-                    return Err(io::Error::new(io::ErrorKind::NotADirectory, new_dir.clone()));
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotADirectory,
+                        new_dir.clone(),
+                    ));
                 }
                 self.check_access(
                     &new_parent_attr,
@@ -1133,7 +1152,10 @@ where
                         .await
                         .map_err(|e| meta_error_to_io(&new, e))?;
                     if !children.is_empty() {
-                        return Err(io::Error::new(io::ErrorKind::DirectoryNotEmpty, new.clone()));
+                        return Err(io::Error::new(
+                            io::ErrorKind::DirectoryNotEmpty,
+                            new.clone(),
+                        ));
                     }
                     self.meta_layer
                         .rmdir(new_dir_ino, &new_name)
@@ -1334,7 +1356,7 @@ where
                 .map_err(|e| meta_error_to_io(&path, e))?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, path.clone()))?;
             if kind != FileType::Symlink {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, path));
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, path.clone()));
             }
             self.meta_layer
                 .read_symlink(ino)
@@ -1360,9 +1382,9 @@ where
             match kind {
                 FileType::File => {}
                 FileType::Dir => {
-                    return Err(io::Error::new(io::ErrorKind::IsADirectory, path));
+                    return Err(io::Error::new(io::ErrorKind::IsADirectory, path.clone()));
                 }
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, path)),
+                _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, path.clone())),
             }
             let attr = self
                 .meta_layer
@@ -1409,25 +1431,24 @@ where
             if req.size.is_some() {
                 self.check_access(attr, AccessMask::WRITE, &path)?;
             }
-            if req.atime.is_some()
+            if (req.atime.is_some()
                 || req.mtime.is_some()
                 || req.ctime.is_some()
                 || flags.contains(SetAttrFlags::SET_ATIME_NOW)
-                || flags.contains(SetAttrFlags::SET_MTIME_NOW)
+                || flags.contains(SetAttrFlags::SET_MTIME_NOW))
+                && self.check_owner(attr, &path).is_err()
             {
-                if self.check_owner(attr, &path).is_err() {
-                    self.check_access(attr, AccessMask::WRITE, &path)?;
-                }
+                self.check_access(attr, AccessMask::WRITE, &path)?;
             }
             let attr = self
                 .meta_layer
                 .set_attr(fi.inode(), req, flags)
                 .await
                 .map_err(|e| meta_error_to_io(&path, e))?;
-            if let Some(size) = req.size {
-                if let Some(inode) = self.files.inode(fi.inode()) {
-                    inode.update_size(size);
-                }
+            if let Some(size) = req.size
+                && let Some(inode) = self.files.inode(fi.inode())
+            {
+                inode.update_size(size);
             }
             Ok(attr)
         }
@@ -1448,7 +1469,7 @@ where
                 .map_err(|e| meta_error_to_io(&path, e))?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, path.clone()))?;
             if kind != FileType::Dir {
-                return Err(io::Error::new(io::ErrorKind::NotADirectory, path));
+                return Err(io::Error::new(io::ErrorKind::NotADirectory, path.clone()));
             }
             let attr = self
                 .meta_layer
@@ -1556,7 +1577,7 @@ where
             .map_err(|e| meta_error_to_io(&path, e))?
         {
             if kind != FileType::Dir {
-                return Err(io::Error::new(io::ErrorKind::NotADirectory, path));
+                return Err(io::Error::new(io::ErrorKind::NotADirectory, path.clone()));
             }
             return Ok(ino);
         }
@@ -1602,7 +1623,11 @@ where
                     cur_attr = attr;
                 }
                 None => {
-                    self.check_access(&cur_attr, AccessMask::WRITE | AccessMask::EXEC, &parent_path)?;
+                    self.check_access(
+                        &cur_attr,
+                        AccessMask::WRITE | AccessMask::EXEC,
+                        &parent_path,
+                    )?;
                     let ino = self
                         .meta_layer
                         .mkdir(cur_ino, part.to_string())
@@ -1623,11 +1648,7 @@ where
         Ok(cur_ino)
     }
 
-    async fn create_file_in_existing_dir(
-        &self,
-        path: &str,
-        create_new: bool,
-    ) -> io::Result<i64> {
+    async fn create_file_in_existing_dir(&self, path: &str, create_new: bool) -> io::Result<i64> {
         if path == "/" {
             return Err(io::Error::new(io::ErrorKind::IsADirectory, path));
         }
@@ -1752,16 +1773,13 @@ where
         return Ok(Vec::new());
     }
     ensure_inode_registered(meta_layer, files, ino, path).await?;
-    let reader = files.reader(ino).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            "file reader is not initialized",
-        )
-    })?;
+    let reader = files
+        .reader(ino)
+        .ok_or_else(|| io::Error::other("file reader is not initialized"))?;
     reader
         .read(offset, len)
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        .map_err(|e| io::Error::other(e.to_string()))
 }
 
 async fn write_inode<S, M>(
@@ -1777,17 +1795,14 @@ where
     M: MetaStore + 'static,
 {
     let inode = ensure_inode_registered(meta_layer, files, ino, path).await?;
-    let writer = files.writer(ino).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            "file writer is not initialized",
-        )
-    })?;
+    let writer = files
+        .writer(ino)
+        .ok_or_else(|| io::Error::other("file writer is not initialized"))?;
     let guard = writer.write().await;
     let written = guard
-        .write(offset, data)
+        .write_at(offset, data)
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     let target_size = offset + data.len() as u64;
     if target_size > inode.file_size() {
@@ -2019,7 +2034,7 @@ where
     }
 
     /// Truncate the file to the given size.
-    pub async fn truncate(&self, size: u64) -> io::Result<()> {
+    pub async fn truncate(&mut self, size: u64) -> io::Result<()> {
         let log_ctx = self.log_context();
         let result = async {
             if !self.flags.write {
@@ -2045,7 +2060,7 @@ where
     }
 
     /// Sync file data to storage.
-    pub async fn sync(&self) -> io::Result<()> {
+    pub async fn sync(&mut self) -> io::Result<()> {
         let log_ctx = self.log_context();
         let result = async {
             if !self.flags.write {
@@ -2054,7 +2069,7 @@ where
 
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+                .map_err(|e| io::Error::other(e.to_string()))?
                 .as_nanos() as i64;
             let req = SetAttrRequest {
                 mtime: Some(now),
@@ -2132,7 +2147,10 @@ mod tests {
         file.write(b"Hello, World!").await.unwrap();
 
         // Read file
-        let file = fs.open("/test/hello.txt", OpenFlags::read_only()).await.unwrap();
+        let file = fs
+            .open("/test/hello.txt", OpenFlags::read_only())
+            .await
+            .unwrap();
         let mut buf = vec![0u8; 20];
         let n = file.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"Hello, World!");
@@ -2181,7 +2199,10 @@ mod tests {
         fs.mkdir("/ptest").await.unwrap();
 
         let file = fs
-            .open("/ptest/random.dat", OpenFlags::create_write().with_truncate())
+            .open(
+                "/ptest/random.dat",
+                OpenFlags::create_write().with_truncate(),
+            )
             .await
             .unwrap();
 

@@ -8,10 +8,12 @@
 use crate::chuck::chunk::ChunkLayout;
 use crate::chuck::store::BlockStore;
 use crate::fs::{FileSystem, FileSystemConfig, OpenFlags};
+use crate::meta::MetaStore;
 use crate::meta::factory::create_meta_store_from_url;
 use crate::meta::file_lock::{FileLockInfo, FileLockQuery, FileLockRange, FileLockType};
-use crate::meta::store::{DirEntry, FileAttr, FileType, MetaError, SetAttrFlags, SetAttrRequest, StatFsSnapshot};
-use crate::meta::MetaStore;
+use crate::meta::store::{
+    DirEntry, FileAttr, FileType, MetaError, SetAttrFlags, SetAttrRequest, StatFsSnapshot,
+};
 use crate::vfs::error::VfsError;
 use std::io;
 use std::path::Path;
@@ -109,7 +111,10 @@ impl<S: BlockStore + Send + Sync + 'static, M: MetaStore + 'static> Client<S, M>
     }
 
     pub async fn truncate(&self, path: &str, size: u64) -> Result<(), String> {
-        self.fs.truncate(path, size).await.map_err(|e| e.to_string())
+        self.fs
+            .truncate(path, size)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Get file lock information for a given path and query.
@@ -118,7 +123,10 @@ impl<S: BlockStore + Send + Sync + 'static, M: MetaStore + 'static> Client<S, M>
         path: &str,
         query: &FileLockQuery,
     ) -> Result<FileLockInfo, String> {
-        self.fs.get_plock(path, query).await.map_err(|e| e.to_string())
+        self.fs
+            .get_plock(path, query)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Set file lock for a given path.
