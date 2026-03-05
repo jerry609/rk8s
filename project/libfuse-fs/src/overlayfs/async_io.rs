@@ -855,32 +855,41 @@ impl Filesystem for OverlayFs {
         r#type: u32,
         pid: u32,
     ) -> Result<ReplyLock> {
-        if !self.no_open.load(Ordering::Relaxed) {
+        let real_handle_info = if !self.no_open.load(Ordering::Relaxed) {
             let handles = self.handles.lock().await;
-            if let Some(hd) = handles.get(&fh)
-                && let Some(ref rh) = hd.real_handle
-            {
-                match rh
-                    .layer
-                    .getlk(
-                        req,
+            handles.get(&fh).and_then(|hd| {
+                hd.real_handle.as_ref().map(|rh| {
+                    (
+                        rh.layer.clone(),
                         rh.inode,
                         rh.handle.load(Ordering::Relaxed),
-                        lock_owner,
-                        start,
-                        end,
-                        r#type,
-                        pid,
                     )
-                    .await
-                {
-                    Ok(reply) => return Ok(reply),
-                    Err(e) => {
-                        // If underlying layer doesn't support locking, fall through to fallback
-                        let errno: i32 = e.into();
-                        if errno != libc::ENOSYS {
-                            return Err(errno.into());
-                        }
+                })
+            })
+        } else {
+            None
+        };
+
+        if let Some((layer, real_inode, real_handle)) = real_handle_info {
+            match layer
+                .getlk(
+                    req,
+                    real_inode,
+                    real_handle,
+                    lock_owner,
+                    start,
+                    end,
+                    r#type,
+                    pid,
+                )
+                .await
+            {
+                Ok(reply) => return Ok(reply),
+                Err(e) => {
+                    // If underlying layer doesn't support locking, fall through to fallback
+                    let errno: i32 = e.into();
+                    if errno != libc::ENOSYS {
+                        return Err(errno.into());
                     }
                 }
             }
@@ -908,40 +917,45 @@ impl Filesystem for OverlayFs {
         pid: u32,
         block: bool,
     ) -> Result<()> {
-        if !self.no_open.load(Ordering::Relaxed) {
+        if self.no_open.load(Ordering::Relaxed) {
+            trace!("setlk: no_open active, cannot delegate lock request");
+            return Err(Error::from_raw_os_error(libc::ENOLCK).into());
+        }
+
+        let real_handle_info = {
             let handles = self.handles.lock().await;
-            if let Some(hd) = handles.get(&fh)
-                && let Some(ref rh) = hd.real_handle
-            {
-                match rh
-                    .layer
-                    .setlk(
-                        req,
+            handles.get(&fh).and_then(|hd| {
+                hd.real_handle.as_ref().map(|rh| {
+                    (
+                        rh.layer.clone(),
                         rh.inode,
                         rh.handle.load(Ordering::Relaxed),
-                        lock_owner,
-                        start,
-                        end,
-                        r#type,
-                        pid,
-                        block,
                     )
-                    .await
-                {
-                    Ok(()) => return Ok(()),
-                    Err(e) => {
-                        // If underlying layer doesn't support locking, fall through to fallback
-                        let errno: i32 = e.into();
-                        if errno != libc::ENOSYS {
-                            return Err(errno.into());
-                        }
-                    }
+                })
+            })
+        };
+        let Some((layer, real_inode, real_handle)) = real_handle_info else {
+            trace!("setlk: missing real handle for fh={fh}, returning ENOLCK");
+            return Err(Error::from_raw_os_error(libc::ENOLCK).into());
+        };
+
+        match layer
+            .setlk(
+                req, real_inode, real_handle, lock_owner, start, end, r#type, pid, block,
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let errno: i32 = e.into();
+                if errno == libc::ENOSYS {
+                    trace!("setlk: underlying layer returned ENOSYS, keeping compatibility fallback");
+                    Ok(())
+                } else {
+                    Err(errno.into())
                 }
             }
         }
-
-        // Fallback: silently accept the lock request
-        Ok(())
     }
     /// check file access permissions. This will be called for the `access()` system call. If the
     /// `default_permissions` mount option is given, this method is not be called. This method is
