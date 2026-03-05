@@ -1877,7 +1877,7 @@ impl Filesystem for PassthroughFs {
         _req: Request,
         inode: Inode,
         fh: u64,
-        _lock_owner: u64,
+        lock_owner: u64,
         start: u64,
         end: u64,
         r#type: u32,
@@ -1888,16 +1888,31 @@ impl Filesystem for PassthroughFs {
         }
 
         let data = self.handle_map.get(fh, inode).await?;
+        // `fcntl(F_GETLK)` is process-scoped; it cannot preserve per-client `lock_owner`
+        // semantics when multiple FUSE clients share the same daemon process.
+        let _ = lock_owner;
+        let lock_type: libc::c_short = r#type
+            .try_into()
+            .map_err(|_| Errno::from(libc::EOVERFLOW))?;
+        let lock_start: libc::off_t = start
+            .try_into()
+            .map_err(|_| Errno::from(libc::EOVERFLOW))?;
+        let lock_len: libc::off_t = if end == u64::MAX {
+            0 // 0 means until EOF
+        } else {
+            end.saturating_sub(start)
+                .try_into()
+                .map_err(|_| Errno::from(libc::EOVERFLOW))?
+        };
+        let lock_pid: libc::pid_t = pid
+            .try_into()
+            .map_err(|_| Errno::from(libc::EOVERFLOW))?;
         let mut flock = libc::flock {
-            l_type: r#type as libc::c_short,
+            l_type: lock_type,
             l_whence: libc::SEEK_SET as libc::c_short,
-            l_start: start as libc::off_t,
-            l_len: if end == u64::MAX {
-                0 // 0 means until EOF
-            } else {
-                end.saturating_sub(start) as libc::off_t
-            },
-            l_pid: pid as libc::pid_t,
+            l_start: lock_start,
+            l_len: lock_len,
+            l_pid: lock_pid,
         };
 
         // SAFETY: We pass a valid fd and a valid pointer to flock.
@@ -1906,15 +1921,35 @@ impl Filesystem for PassthroughFs {
             return Err(io::Error::last_os_error().into());
         }
 
+        let reply_start: u64 = flock
+            .l_start
+            .try_into()
+            .map_err(|_| Errno::from(libc::EOVERFLOW))?;
+        let reply_end = if flock.l_len == 0 {
+            u64::MAX
+        } else {
+            let len: u64 = flock
+                .l_len
+                .try_into()
+                .map_err(|_| Errno::from(libc::EOVERFLOW))?;
+            reply_start
+                .checked_add(len)
+                .ok_or(Errno::from(libc::EOVERFLOW))?
+        };
+        let reply_type: u32 = flock
+            .l_type
+            .try_into()
+            .map_err(|_| Errno::from(libc::EOVERFLOW))?;
+        let reply_pid: u32 = flock
+            .l_pid
+            .try_into()
+            .map_err(|_| Errno::from(libc::EOVERFLOW))?;
+
         Ok(ReplyLock {
-            start: flock.l_start as u64,
-            end: if flock.l_len == 0 {
-                u64::MAX
-            } else {
-                flock.l_start as u64 + flock.l_len as u64
-            },
-            r#type: flock.l_type as u32,
-            pid: flock.l_pid as u32,
+            start: reply_start,
+            end: reply_end,
+            r#type: reply_type,
+            pid: reply_pid,
         })
     }
 
@@ -1924,7 +1959,7 @@ impl Filesystem for PassthroughFs {
         _req: Request,
         inode: Inode,
         fh: u64,
-        _lock_owner: u64,
+        lock_owner: u64,
         start: u64,
         end: u64,
         r#type: u32,
@@ -1936,16 +1971,31 @@ impl Filesystem for PassthroughFs {
         }
 
         let data = self.handle_map.get(fh, inode).await?;
+        // `fcntl(F_SETLK/F_SETLKW)` is process-scoped; `lock_owner` is intentionally not
+        // enforced here and different FUSE lock owners may interfere in one daemon process.
+        let _ = lock_owner;
+        let lock_type: libc::c_short = r#type
+            .try_into()
+            .map_err(|_| Errno::from(libc::EOVERFLOW))?;
+        let lock_start: libc::off_t = start
+            .try_into()
+            .map_err(|_| Errno::from(libc::EOVERFLOW))?;
+        let lock_len: libc::off_t = if end == u64::MAX {
+            0 // 0 means until EOF
+        } else {
+            end.saturating_sub(start)
+                .try_into()
+                .map_err(|_| Errno::from(libc::EOVERFLOW))?
+        };
+        let lock_pid: libc::pid_t = pid
+            .try_into()
+            .map_err(|_| Errno::from(libc::EOVERFLOW))?;
         let flock = libc::flock {
-            l_type: r#type as libc::c_short,
+            l_type: lock_type,
             l_whence: libc::SEEK_SET as libc::c_short,
-            l_start: start as libc::off_t,
-            l_len: if end == u64::MAX {
-                0 // 0 means until EOF
-            } else {
-                end.saturating_sub(start) as libc::off_t
-            },
-            l_pid: pid as libc::pid_t,
+            l_start: lock_start,
+            l_len: lock_len,
+            l_pid: lock_pid,
         };
 
         let cmd = if block { libc::F_SETLKW } else { libc::F_SETLK };
